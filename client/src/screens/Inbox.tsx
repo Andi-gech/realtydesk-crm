@@ -2043,6 +2043,7 @@ function ChatThread({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+            aria-label="Type a message"
             placeholder={role === 'owner' ? "Reply as Owner (stepped in)…" : "Type a message…"}
             disabled={sending}
           />
