@@ -206,7 +206,6 @@ export const api = {
       body: JSON.stringify({ text, telegramMessageId, mediaRef }),
     }),
 
-  getContact: (id: string) => request<{ contact: any }>(`/contacts/${id}`),
   contactNotes: (id: string) => request<{ notes: any[] }>(`/contacts/${id}/notes`),
   addContactNote: (id: string, text: string) =>
     request<{ note: any }>(`/contacts/${id}/notes`, { method: 'POST', body: JSON.stringify({ text }) }),

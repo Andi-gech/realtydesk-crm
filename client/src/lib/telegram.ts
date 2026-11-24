@@ -61,7 +61,6 @@ export async function requestTelegramPhoneCode(
 }> {
   const log = (text: string, type: 'info' | 'warn' | 'error' | 'success' = 'info') => {
     const time = new Date().toLocaleTimeString();
-    console.log(`%c[Telegram LIVE ${time}] [${type.toUpperCase()}] ${text}`, type === 'error' ? 'color: #ef4444' : type === 'success' ? 'color: #22c55e' : type === 'warn' ? 'color: #f59e0b' : 'color: #3b82f6');
     if (onLog) onLog({ time, text, type });
   };
 
@@ -157,7 +156,6 @@ export async function submitTelegramCode(
 }> {
   const log = (text: string, type: 'info' | 'warn' | 'error' | 'success' = 'info') => {
     const time = new Date().toLocaleTimeString();
-    console.log(`%c[Telegram LIVE ${time}] [${type.toUpperCase()}] ${text}`, type === 'error' ? 'color: #ef4444' : type === 'success' ? 'color: #22c55e' : type === 'warn' ? 'color: #f59e0b' : 'color: #3b82f6');
     if (onLog) onLog({ time, text, type });
   };
 
@@ -243,7 +241,6 @@ export async function submitTelegram2FAPassword(
 }> {
   const log = (text: string, type: 'info' | 'warn' | 'error' | 'success' = 'info') => {
     const time = new Date().toLocaleTimeString();
-    console.log(`%c[Telegram LIVE ${time}] [${type.toUpperCase()}] ${text}`, type === 'error' ? 'color: #ef4444' : type === 'success' ? 'color: #22c55e' : type === 'warn' ? 'color: #f59e0b' : 'color: #3b82f6');
     if (onLog) onLog({ time, text, type });
   };
 
@@ -311,7 +308,6 @@ export async function startTelegramQrLogin(
 }> {
   const log = (text: string, type: 'info' | 'warn' | 'error' | 'success' = 'info') => {
     const time = new Date().toLocaleTimeString();
-    console.log(`%c[Telegram QR ${time}] [${type.toUpperCase()}] ${text}`, type === 'error' ? 'color: #ef4444' : type === 'success' ? 'color: #22c55e' : type === 'warn' ? 'color: #f59e0b' : 'color: #3b82f6');
     if (onLog) onLog({ time, text, type });
   };
 

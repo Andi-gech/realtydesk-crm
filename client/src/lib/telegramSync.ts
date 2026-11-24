@@ -56,11 +56,9 @@ export async function syncAccountChats(
 
     const lastSync = forceFull ? 0 : getLastSyncTime(telegramAccountId);
     onProgress?.(lastSync > 0 ? 'Checking for new Telegram messages...' : 'Fetching all dialogs from Telegram...');
-    console.log('[telegramSync] Loading dialogs for account:', telegramAccountId, { lastSync, forceFull });
 
     // Fetch up to 500 dialogs so no historical chats are omitted
     const dialogs = await client.getDialogs({ limit: 500 });
-    console.log(`[telegramSync] Found ${dialogs.length} dialogs.`);
 
     if (!dialogs || dialogs.length === 0) {
       onProgress?.('No dialogs found on Telegram.');
@@ -292,7 +290,6 @@ export async function syncAccountChats(
     }
 
     setLastSyncTime(telegramAccountId, Date.now());
-    console.log(`[telegramSync] Completed sync: ${syncedCount} chats synced.`);
     onProgress?.(syncedCount > 0 ? `Synced ${syncedCount} updated chats!` : 'All chats are up to date');
 
     // Progressively download avatars for any remaining dialogs in background
@@ -336,11 +333,9 @@ export function startLiveSync(
     return () => {};
   }
   activeListeners.add(telegramAccountId);
-  console.log('[telegramSync] Starting live message listener for account:', telegramAccountId);
 
   return setupUpdateListener(client, async (msg) => {
     try {
-      console.log('[telegramSync] Live message event received:', msg.telegramMessageId);
       let mediaRef: string | undefined = undefined;
       if ((msg as any).media) {
         try {
@@ -388,7 +383,6 @@ export async function syncAllLinkedAccounts(
   try {
     const { telegramAccounts } = await api.myTelegramAccounts();
     if (!telegramAccounts || telegramAccounts.length === 0) {
-      console.log('[telegramSync] No linked telegram accounts found on server for user.');
       return 0;
     }
 

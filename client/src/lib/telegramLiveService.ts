@@ -105,7 +105,6 @@ export async function fetchLiveTelegramChats(
     } catch {}
 
     // 2. Fetch dialogs directly from Telegram MTProto (both main folder and archived folder 1)
-    console.log(`[telegramLiveService] Loading live dialogs from Telegram for account: ${telegramAccountId}...`);
     const [mainDialogs, archivedDialogs] = await Promise.all([
       client.getDialogs({ limit }),
       client.getDialogs({ folder: 1, limit: 100 }).catch(() => []),
@@ -129,7 +128,6 @@ export async function fetchLiveTelegramChats(
       }
     }
 
-    console.log(`[telegramLiveService] Received ${dialogs.length} total dialogs (${mainDialogs?.length || 0} active, ${archivedDialogs?.length || 0} archived).`);
 
     const liveChats: LiveChat[] = [];
 

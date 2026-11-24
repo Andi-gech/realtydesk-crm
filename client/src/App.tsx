@@ -62,7 +62,6 @@ export default function App() {
             }
           }
           if (isExpired) {
-            console.log('[App] Access token expired or missing, attempting auto-refresh...');
             const ok = await tryRefresh();
             if (ok) {
               const tokens = await loadAuthTokens();

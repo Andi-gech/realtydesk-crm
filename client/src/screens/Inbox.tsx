@@ -31,7 +31,6 @@ import {
   BuildingIcon,
   LightningIcon,
   AlertTriangleIcon,
-  MessageSquareIcon,
   TrashIcon,
   RepeatIcon,
 } from '../components/Icons';
@@ -392,22 +391,12 @@ function RepeatedIndicator({
       className={`repeated-indicator-wrap size-${size} ${isOpen ? 'hovered' : ''}`}
       onMouseEnter={open}
       onMouseLeave={scheduleClose}
-      onClick={togglePin}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          togglePin(e);
-        }
-      }}
-      role="button"
-      tabIndex={0}
-      aria-label="Repeated lead across accounts"
     >
       <button
         type="button"
         className="repeated-icon-pill"
         title="Repeated lead — click or hover for details"
-        tabIndex={-1}
+        onClick={togglePin}
       >
         <RepeatIcon size={size === 'md' ? 13 : 11} className="repeated-svg-icon" />
       </button>
@@ -485,6 +474,15 @@ const ChatItem = memo(function ChatItem({
     <li
       className={`chat-item ${isSelected ? 'selected' : ''} ${isBlocked ? 'is-blocked-chat' : ''}`}
       onClick={() => onSelect(chat._id || chat.externalChatId)}
+      role="button"
+      tabIndex={0}
+      aria-label="Open conversation"
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelect(chat._id || chat.externalChatId);
+        }
+      }}
     >
       <div className="chat-avatar-wrap">
         <Avatar
@@ -512,7 +510,7 @@ const ChatItem = memo(function ChatItem({
         <div className="chat-row-bottom">
           <p className="chat-preview">
             {chat.lastMessagePreview === '[Media]' || chat.lastMessagePreview === '[Photo]' || chat.lastMessagePreview?.startsWith('data:image') ? (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#2481cc', fontWeight: 500 }}>
+              <span className="chat-preview-media">
                 <PhotoIcon size={13} /> Photo
               </span>
             ) : (
@@ -856,7 +854,6 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               if (!isCancelled) {
                 setSyncProgress((p) => (p ? { done: p.done + items.length, total: p.total } : null));
               }
-              console.log(`[Inbox] Bulk-synced ${items.length} dialogs for account ${acc.phoneMasked || acc._id}`);
             } catch (syncErr: any) {
               console.warn(`[Inbox] Bulk sync note for ${acc.phoneMasked || acc._id}:`, syncErr.message);
             }
