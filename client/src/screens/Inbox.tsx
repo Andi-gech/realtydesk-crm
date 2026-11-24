@@ -149,7 +149,7 @@ function ContactNotesDrawer({
               {contactInfo?.savedName || contactInfo?.displayName || 'Lead Notes'}
             </span>
           </div>
-          <button className="icon-btn" onClick={onClose} title="Close Notes">
+          <button className="icon-btn" onClick={onClose} title="Close Notes" aria-label="Close Lead Dossier & Notes">
             <CloseIcon size={18} />
           </button>
         </div>
@@ -996,7 +996,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               <span className={`role-badge ${role}`}>{role === 'owner' ? 'Owner Mode' : 'Agent Mode'}</span>
             </div>
           </div>
-          <button className="tg-drawer-close" onClick={() => setDrawerOpen(false)} title="Close menu">
+          <button className="tg-drawer-close" onClick={() => setDrawerOpen(false)} title="Close menu" aria-label="Close navigation menu">
             <CloseIcon size={18} />
           </button>
         </div>
@@ -1113,6 +1113,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               className="tg-hamburger-btn"
               onClick={() => setDrawerOpen(true)}
               title="Open Navigation Menu"
+              aria-label="Open navigation menu"
             >
               <MenuIcon size={20} />
             </button>
@@ -1121,13 +1122,14 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               <input
                 className="tg-search-input"
                 placeholder="Search"
+                aria-label="Search conversations"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
               />
               {isSearching ? (
                 <span className="inline-btn-spinner dark tg-search-spinner" />
               ) : query ? (
-                <button className="tg-search-clear" onClick={() => setQuery('')}>
+                <button className="tg-search-clear" onClick={() => setQuery('')} aria-label="Clear search">
                   <CloseIcon size={13} />
                 </button>
               ) : null}
@@ -1875,7 +1877,7 @@ function ChatThread({
       {previewMedia && (
         <div className="media-preview-overlay" onClick={() => setPreviewMedia(null)}>
           <div className="media-preview-dialog" onClick={(e) => e.stopPropagation()}>
-            <button className="media-preview-close" onClick={() => setPreviewMedia(null)}>
+            <button className="media-preview-close" onClick={() => setPreviewMedia(null)} aria-label="Close media preview">
               <CloseIcon size={20} />
             </button>
             <img src={previewMedia} alt="Preview" className="media-preview-img-full" />

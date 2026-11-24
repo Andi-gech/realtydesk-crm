@@ -6,7 +6,7 @@
   --bubble-in: linear-gradient(180deg, #ffffff 0%, #fafdff 100%);
   --bubble-out: linear-gradient(145deg, #e7f7dc 0%, #d4f0be 100%);
   --header-gradient: linear-gradient(180deg, #ffffff 0%, #f9fbfd 100%);
-  --sidebar-gradient: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+  --text-bright: #0f172a;
   --chat-bg-gradient:
     radial-gradient(ellipse 75% 55% at 88% 12%, rgba(214, 233, 255, 0.75) 0%, transparent 60%),
     radial-gradient(ellipse 65% 45% at 12% 88%, rgba(226, 239, 255, 0.85) 0%, transparent 60%),
@@ -256,6 +256,8 @@ body,
 .small-btn {
   padding: 0.3rem 0.65rem;
   font-size: 0.8rem;
+  min-height: 36px;
+  min-width: 36px;
 }
 
 .full-width {
@@ -388,6 +390,7 @@ select:focus {
 .role-tabs button {
   flex: 1;
   padding: 0.6rem;
+  min-height: 36px;
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
@@ -470,6 +473,7 @@ select:focus {
   font-size: 0.75rem;
   font-weight: 600;
   padding: 0.35rem 0.25rem;
+  min-height: 34px;
   border-radius: 4px;
   color: var(--text-muted);
   cursor: pointer;
@@ -706,8 +710,8 @@ select:focus {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 19px;
-  height: 19px;
+  width: 22px;
+  height: 22px;
   border-radius: 5px;
   background: rgba(245, 158, 11, 0.12);
   border: 1px solid rgba(245, 158, 11, 0.28);
@@ -2109,6 +2113,8 @@ select:focus {
 
 .tg-filter-tabs {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
   scrollbar-width: none;
   padding: 2px;
 }
@@ -2564,6 +2570,7 @@ select:focus {
   background: #ffffff;
   color: #4b5563;
   padding: 4px 10px;
+  min-height: 30px;
   border-radius: 14px;
   font-size: 11px;
   font-weight: 500;
@@ -3332,6 +3339,25 @@ select:focus {
   flex: 1;
   overflow-y: auto;
   margin-top: 0.75rem;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 6px;
+  min-height: 28px;
+  min-width: 28px;
+}
+
+.icon-btn:hover {
+  background: #f1f5f9;
+  color: var(--text-main);
 }
 
 /* Owner Admin — page wrapper for the scrollable content */
