@@ -1,22 +1,27 @@
 import React, { memo, useState, useEffect } from 'react';
 
-const TELEGRAM_GRADIENTS = [
-  'linear-gradient(135deg, #ff885e 0%, #ff516a 100%)', // Red
-  'linear-gradient(135deg, #ffaa42 0%, #ff6e2e 100%)', // Orange
-  'linear-gradient(135deg, #a665ff 0%, #7645ff 100%)', // Violet
-  'linear-gradient(135deg, #51e29e 0%, #2ac275 100%)', // Green
-  'linear-gradient(135deg, #4bd1f2 0%, #17a9e0 100%)', // Cyan
-  'linear-gradient(135deg, #56b5f5 0%, #2a8be8 100%)', // Blue
-  'linear-gradient(135deg, #f767a6 0%, #e03884 100%)', // Pink
+/**
+ * Flat, pale tints with dark ink — eight hues at least 60° apart.
+ * No gradients: an avatar is an identity chip, not decoration.
+ */
+const AVATAR_TINTS: Array<{ bg: string; ink: string }> = [
+  { bg: '#e8effa', ink: '#1b4b8f' },
+  { bg: '#e6f3ec', ink: '#1c5c3f' },
+  { bg: '#f7ecdf', ink: '#7c4a15' },
+  { bg: '#f2e9f6', ink: '#5c3a72' },
+  { bg: '#e5f2f3', ink: '#155e66' },
+  { bg: '#f8e9ea', ink: '#8a2b31' },
+  { bg: '#eef0e4', ink: '#4c5326' },
+  { bg: '#ecebf3', ink: '#3f4275' },
 ];
 
-function getTelegramColor(identifier: string): string {
+function getTelegramColor(identifier: string): { bg: string; ink: string } {
   let hash = 0;
   for (let i = 0; i < identifier.length; i++) {
     hash = (hash * 31 + identifier.charCodeAt(i)) | 0;
   }
-  const index = Math.abs(hash) % TELEGRAM_GRADIENTS.length;
-  return TELEGRAM_GRADIENTS[index];
+  const index = Math.abs(hash) % AVATAR_TINTS.length;
+  return AVATAR_TINTS[index];
 }
 
 function getInitials(name?: string): string {
@@ -41,7 +46,7 @@ interface AvatarProps {
 export const Avatar: React.FC<AvatarProps> = memo(({ name = '', id = '', photoUrl, size = 44, isOnline }) => {
   const [imgFailed, setImgFailed] = useState(false);
   const identifier = id || name || 'unknown';
-  const background = getTelegramColor(identifier);
+  const tint = getTelegramColor(identifier);
   const initials = getInitials(name || identifier);
 
   useEffect(() => {
@@ -72,7 +77,8 @@ export const Avatar: React.FC<AvatarProps> = memo(({ name = '', id = '', photoUr
         <div
           className="tg-avatar-placeholder"
           style={{
-            background,
+            background: tint.bg,
+            color: tint.ink,
             fontSize: `${Math.round(size * 0.42)}px`,
           }}
         >

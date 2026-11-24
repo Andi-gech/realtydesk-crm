@@ -8,9 +8,16 @@ import { loadAuthTokens, saveAuthTokens } from '../lib/secureStorage';
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000/api/v1';
 
+let authFailureHandler: (() => void) | null = null;
+export function registerAuthFailureHandler(handler: () => void) {
+  authFailureHandler = handler;
+}
+
 async function request<T>(path: string, options: RequestInit = {}, isRetry = false): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
+  const timer = setTimeout(() => {
+    controller.abort(new Error('Request timed out after 10 seconds'));
+  }, 10000);
 
   try {
     const { accessToken } = await loadAuthTokens();
@@ -30,6 +37,7 @@ async function request<T>(path: string, options: RequestInit = {}, isRetry = fal
       if (refreshed) {
         return request<T>(path, options, true);
       }
+      if (authFailureHandler) authFailureHandler();
     }
 
     if (!res.ok) {
@@ -38,6 +46,11 @@ async function request<T>(path: string, options: RequestInit = {}, isRetry = fal
     }
 
     return res.json();
+  } catch (err: any) {
+    if (err.name === 'AbortError' || err.message?.includes('aborted')) {
+      throw new Error('Server request timed out. Please verify the backend server and MongoDB database are reachable.');
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -47,7 +60,9 @@ export async function tryRefresh(): Promise<boolean> {
   const { refreshToken } = await loadAuthTokens();
   if (!refreshToken) return false;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6000);
+  const timer = setTimeout(() => {
+    controller.abort(new Error('Refresh request timed out after 6 seconds'));
+  }, 6000);
   try {
     const res = await fetch(`${BASE_URL}/auth/refresh`, {
       method: 'POST',
@@ -220,6 +235,8 @@ export const api = {
       body: JSON.stringify({ maxUses, expiresAt }),
     }),
   listActivationCodes: () => request<{ activationCodes: any[] }>('/owner/activation-codes'),
+
+  logout: () => request<{ ok: true }>('/auth/logout', { method: 'POST' }),
 
   listAgents: () => request<{ agents: any[] }>('/owner/agents'),
   createAgent: (payload: { username: string; password: string; displayName: string }) =>

@@ -5,6 +5,7 @@ const ActivationCode = require('../models/ActivationCode');
 const Agent = require('../models/Agent');
 const TelegramAccount = require('../models/TelegramAccount');
 const { requireAuth, requireRole } = require('../middleware/auth');
+const { deleteAgentData } = require('../services/cleanupService');
 
 const router = express.Router();
 router.use(requireAuth, requireRole('owner'));
@@ -95,6 +96,7 @@ router.delete('/agents/:id', async (req, res) => {
   const agent = await Agent.findOne({ _id: req.params.id, orgId: req.auth.orgId });
   if (!agent) return res.status(404).json({ error: 'Agent not found' });
 
+  await deleteAgentData(req.auth.orgId, agent._id);
   await Agent.deleteOne({ _id: agent._id });
   return res.json({ ok: true, message: 'Agent deleted' });
 });

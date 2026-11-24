@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useState, useRef, memo, useCallback, useMem
 import { createPortal } from 'react-dom';
 import { api } from '../api/client';
 import { Avatar } from '../components/Avatar';
+import BrandMark from '../components/BrandMark';
 import { getCachedAvatar, subscribeAvatarUpdates } from '../lib/avatarCache';
 import { deleteSession } from '../lib/secureStorage';
 import {
@@ -405,7 +406,7 @@ function RepeatedIndicator({
         createPortal(
           <div
             ref={popRef}
-            className={`repeated-detail-popover visible placement-${pos?.placement || 'below'}`}
+            className={`repeated-detail-popover placement-${pos?.placement || 'below'}`}
             style={
               pos
                 ? { position: 'fixed', top: pos.top, left: pos.left }
@@ -472,7 +473,9 @@ const ChatItem = memo(function ChatItem({
 
   return (
     <li
-      className={`chat-item ${isSelected ? 'selected' : ''} ${isBlocked ? 'is-blocked-chat' : ''}`}
+      className={`chat-item ${isSelected ? 'selected' : ''} ${isBlocked ? 'is-blocked-chat' : ''} ${
+        chat.unreadCount > 0 ? 'is-unread' : ''
+      }`}
       onClick={() => onSelect(chat._id || chat.externalChatId)}
       role="button"
       tabIndex={0}
@@ -939,6 +942,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     return true;
   });
 
+  const unreadCount = chats.filter((c) => c.unreadCount > 0 && !c.isArchived).length;
+
   const handleSelectChat = useCallback((id: string) => {
     setSelectedChatId(id);
     setChats((prev) =>
@@ -993,7 +998,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               {telegramAccounts[0]?.phoneMasked && (
                 <div className="tg-drawer-sub">{telegramAccounts[0].phoneMasked}</div>
               )}
-              <span className={`role-badge ${role}`}>{role === 'owner' ? 'Owner Mode' : 'Agent Mode'}</span>
+              <span className={`role-badge ${role}`}>{role === 'owner' ? 'Owner' : 'Agent'}</span>
             </div>
           </div>
           <button className="tg-drawer-close" onClick={() => setDrawerOpen(false)} title="Close menu" aria-label="Close navigation menu">
@@ -1004,9 +1009,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         <div className="tg-drawer-content">
           <div className="tg-drawer-section">
             <div className="tg-drawer-section-title">
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                <PhoneIcon size={14} /> Connected Accounts ({telegramAccounts.length})
-              </span>
+              <PhoneIcon size={14} />
+              <span>Connected accounts ({telegramAccounts.length})</span>
             </div>
             {telegramAccounts.length === 0 ? (
               <p className="tg-drawer-empty">No Telegram accounts connected.</p>
@@ -1038,9 +1042,12 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                         photoUrl={getCachedAvatar(acc.telegramUserId || acc._id)}
                         size={34}
                       />
-                      <div style={{ marginLeft: '6px' }}>
+                      <div className="tg-acc-meta">
                         <div className="tg-acc-name">{acc.displayName || `Account ${acc.phoneMasked || ''}`}</div>
-                        <div className="tg-acc-sub">{acc.phoneMasked || ''} • ID: {acc.telegramUserId}</div>
+                        <div className="tg-acc-sub">
+                          {acc.phoneMasked || 'Telegram'}
+                          <span className="tg-acc-id">ID {acc.telegramUserId}</span>
+                        </div>
                       </div>
                     </div>
                     <button
@@ -1059,35 +1066,28 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             )}
             {onAddTelegram && (
               <button
-                className="secondary-btn small-btn full-width"
-                style={{ marginTop: '8px' }}
+                className="secondary-btn small-btn full-width drawer-add-account"
                 onClick={() => { setDrawerOpen(false); onAddTelegram(); }}
               >
-                + Add Another Telegram
+                Add another account
               </button>
             )}
           </div>
 
           <div className="tg-drawer-section">
             <div className="tg-drawer-section-title">
-              <span>Telegram Connection</span>
+              <span>Telegram connection</span>
             </div>
             <div className={`tg-drawer-status-card ${connectedAccounts > 0 ? '' : 'is-offline'}`}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div className="tg-drawer-status-row">
                 <span className={connectedAccounts > 0 ? 'live-pulse-dot' : 'offline-dot'} />
-                <span
-                  style={{
-                    fontSize: '13px',
-                    fontWeight: 600,
-                    color: connectedAccounts > 0 ? '#16a34a' : '#b45309',
-                  }}
-                >
+                <span className="tg-drawer-status-label">
                   {connectedAccounts > 0
-                    ? `Live — ${connectedAccounts} account${connectedAccounts === 1 ? '' : 's'} connected`
+                    ? `Live · ${connectedAccounts} account${connectedAccounts === 1 ? '' : 's'} connected`
                     : 'Not connected'}
                 </span>
               </div>
-              <p style={{ margin: '6px 0 0 0', fontSize: '12px', color: '#6b7280', lineHeight: 1.4 }}>
+              <p>
                 {connectedAccounts > 0
                   ? 'Messages update live from your linked Telegram accounts. No manual syncing needed.'
                   : 'Link a Telegram account to send and receive messages live. Until then you are viewing saved history.'}
@@ -1098,9 +1098,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           {role === 'owner' && (
             <div className="tg-drawer-section">
               <div className="tg-drawer-section-title">
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                  <BuildingIcon size={14} /> Chat Visibility
-                </span>
+                <BuildingIcon size={14} />
+                <span>Chat visibility</span>
               </div>
               <div className="scope-toggle">
                 <button className={scope === 'all' ? 'active' : ''} onClick={() => setScope('all')}>
@@ -1116,21 +1115,39 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       </div>
 
       <aside className="chat-list-panel">
-        <div className="chat-list-header tg-clean-header">
-          <div className="tg-search-row">
+        <div className="chat-list-header">
+          <div className="list-title-row">
             <button
               className="tg-hamburger-btn"
               onClick={() => setDrawerOpen(true)}
-              title="Open Navigation Menu"
+              title="Open navigation menu"
               aria-label="Open navigation menu"
             >
-              <MenuIcon size={20} />
+              <MenuIcon size={18} />
             </button>
+            <h1 className="list-title">Inbox</h1>
+            <span className="list-count">
+              {filteredChats.length} {filteredChats.length === 1 ? 'chat' : 'chats'}
+            </span>
+            <div
+              className={`live-status-pill ${connectedAccounts > 0 ? '' : 'offline'}`}
+              title={
+                connectedAccounts > 0
+                  ? 'Live Telegram connection active'
+                  : 'No Telegram account connected — showing saved history'
+              }
+            >
+              <span className={connectedAccounts > 0 ? 'live-pulse-dot' : 'offline-dot'} />
+              <span>{connectedAccounts > 0 ? 'Live' : 'Offline'}</span>
+            </div>
+          </div>
+
+          <div className="tg-search-row">
             <div className="tg-search-input-wrap">
               <SearchIcon size={16} className="tg-search-icon" />
               <input
                 className="tg-search-input"
-                placeholder="Search"
+                placeholder="Search conversations"
                 aria-label="Search conversations"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -1142,17 +1159,6 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                   <CloseIcon size={13} />
                 </button>
               ) : null}
-            </div>
-            <div
-              className={`live-status-pill ${connectedAccounts > 0 ? '' : 'offline'}`}
-              title={
-                connectedAccounts > 0
-                  ? 'Live Telegram connection active'
-                  : 'No Telegram account connected — showing saved history'
-              }
-            >
-              <span className={connectedAccounts > 0 ? 'live-pulse-dot' : 'offline-dot'} />
-              <span>{connectedAccounts > 0 ? 'Live' : 'Offline'}</span>
             </div>
           </div>
 
@@ -1173,7 +1179,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                 </span>
               </div>
               <span className="repeated-counter-action">
-                {filter === 'repeated' ? 'Show All' : 'View →'}
+                {filter === 'repeated' ? 'Show all' : 'View all'}
               </span>
             </div>
           )}
@@ -1233,7 +1239,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             <div className="sync-progress-track">
               <div
                 className="sync-progress-fill"
-                style={{ width: `${Math.round((syncProgress.done / syncProgress.total) * 100)}%` }}
+                style={{ transform: `scaleX(${Math.min(1, syncProgress.done / syncProgress.total)})` }}
               />
             </div>
           </div>
@@ -1243,8 +1249,14 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           {loadingChats ? (
             <ChatSkeletons count={8} />
           ) : filteredChats.length === 0 ? (
-            <li className="no-chats-msg" style={{ padding: '2.5rem 1rem', textAlign: 'center' }}>
-              <p style={{ margin: '0', color: '#6b7280' }}>No chats found in this view.</p>
+            <li className="no-chats-msg">
+              <p>
+                {query.trim()
+                  ? `No conversations match “${query.trim()}”.`
+                  : filter === 'all'
+                    ? 'No conversations yet.'
+                    : 'Nothing in this view.'}
+              </p>
             </li>
           ) : (
             filteredChats.map((chat) => {
@@ -1289,9 +1301,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           <div className="thread-empty-wrapper">
             <div className="thread-empty-card">
               <div className="thread-empty-emblem-wrap">
-                <div className="thread-empty-emblem-glow" />
                 <div className="thread-empty-emblem">
-                  <SendIcon size={28} className="thread-empty-icon" />
+                  <BrandMark size={26} />
                 </div>
               </div>
 
@@ -1302,21 +1313,22 @@ export default function Inbox({ role, onAddTelegram }: Props) {
 
               <h2 className="thread-empty-title">Select a conversation</h2>
               <p className="thread-empty-subtitle">
-                Choose a client or lead from the list on the left to view messages, review property requests, and manage CRM dossiers.
+                Pick a client or lead to read the thread, answer property requests, and keep the
+                dossier up to date.
               </p>
 
               <div className="thread-empty-hints">
                 <div className="thread-empty-hint-chip">
-                  <span className="hint-chip-icon">💬</span>
-                  <span>Instant message sync</span>
+                  <strong>{chats.filter((c) => !c.isArchived).length}</strong>
+                  <span>conversations</span>
                 </div>
                 <div className="thread-empty-hint-chip">
-                  <span className="hint-chip-icon">⚡</span>
-                  <span>Direct live replies</span>
+                  <strong>{unreadCount}</strong>
+                  <span>unread</span>
                 </div>
                 <div className="thread-empty-hint-chip">
-                  <span className="hint-chip-icon">🔒</span>
-                  <span>Sessions stay on this device</span>
+                  <strong>{repeatedChatIds.size}</strong>
+                  <span>repeated clients</span>
                 </div>
               </div>
             </div>
@@ -1450,6 +1462,7 @@ function ChatThread({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesAreaRef = useRef<HTMLDivElement>(null);
+  const topSentinelRef = useRef<HTMLDivElement>(null);
   const shouldScrollToBottomRef = useRef(true);
 
   // Each conversation must be read/sent through the MTProto client that owns it.
@@ -1527,7 +1540,8 @@ function ChatThread({
       if (!msgs || msgs.length === 0) {
         const res = await api.chatMessages(chat._id).catch(() => ({ messages: [] }));
         msgs = res.messages || [];
-        setHasMore(false);
+        setHasMore(msgs.length >= 100);
+        if (msgs.length > 0) setOldestId(new Date(msgs[0].sentAt).getTime());
       }
 
       setMessages(msgs);
@@ -1546,7 +1560,6 @@ function ChatThread({
   const loadOlderMessages = async () => {
     if (loadingMore || !hasMore || !oldestId) return;
     const peer = chat.entity || chat.inputEntity || chat.externalChatId;
-    if (!chatClient || !chatClient.connected || !peer) return;
 
     setLoadingMore(true);
     shouldScrollToBottomRef.current = false;
@@ -1554,31 +1567,56 @@ function ChatThread({
     const prevScrollTop = messagesAreaRef.current?.scrollTop || 0;
 
     try {
-      const res = await fetchLiveTelegramMessages(
-        chatClient,
-        peer,
-        { limit: 100, offsetId: oldestId },
-        (msgId, dataUrl) => {
-          setMessages((prev) =>
-            prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: dataUrl } : m))
-          );
-        }
-      );
-
-      if (res.messages && res.messages.length > 0) {
-        const olderMessages = res.messages.map((m: any) =>
-          m.direction === 'out' ? { ...m, senderType: outgoingSenderType } : m
+      // Live Telegram path
+      if (chatClient && chatClient.connected && peer) {
+        const res = await fetchLiveTelegramMessages(
+          chatClient,
+          peer,
+          { limit: 100, offsetId: oldestId },
+          (msgId, dataUrl) => {
+            setMessages((prev) =>
+              prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: dataUrl } : m))
+            );
+          }
         );
+
+        if (res.messages && res.messages.length > 0) {
+          const olderMessages = res.messages.map((m: any) =>
+            m.direction === 'out' ? { ...m, senderType: outgoingSenderType } : m
+          );
+          setMessages((prev) => {
+            const existingIds = new Set(prev.map((m) => m.telegramMessageId || m._id));
+            const newUnique = olderMessages.filter((m) => !existingIds.has(m.telegramMessageId || m._id));
+            return [...newUnique, ...prev];
+          });
+          setHasMore(res.hasMore);
+          if (res.oldestId) setOldestId(res.oldestId);
+          if (res.total) setTotalCount(res.total);
+
+          requestAnimationFrame(() => {
+            if (messagesAreaRef.current) {
+              const newScrollHeight = messagesAreaRef.current.scrollHeight;
+              messagesAreaRef.current.scrollTop = newScrollHeight - prevScrollHeight + prevScrollTop;
+            }
+          });
+        } else {
+          setHasMore(false);
+        }
+        return;
+      }
+
+      // Server DB path (no live session): paginate by sentAt timestamp
+      const res = await api.chatMessages(chat._id, oldestId, 100).catch(() => ({ messages: [] }));
+      const older = res.messages || [];
+      if (older.length > 0) {
         setMessages((prev) => {
           const existingIds = new Set(prev.map((m) => m.telegramMessageId || m._id));
-          const newUnique = olderMessages.filter((m) => !existingIds.has(m.telegramMessageId || m._id));
+          const newUnique = older.filter((m) => !existingIds.has(m.telegramMessageId || m._id));
           return [...newUnique, ...prev];
         });
-        setHasMore(res.hasMore);
-        if (res.oldestId) setOldestId(res.oldestId);
-        if (res.total) setTotalCount(res.total);
+        setHasMore(older.length >= 100);
+        if (older.length > 0) setOldestId(new Date(older[0].sentAt).getTime());
 
-        // Keep scroll stable
         requestAnimationFrame(() => {
           if (messagesAreaRef.current) {
             const newScrollHeight = messagesAreaRef.current.scrollHeight;
@@ -1672,6 +1710,23 @@ function ChatThread({
       if (cleanup) cleanup();
     };
   }, [chat._id, chat.externalChatId, chatClient, outgoingSenderType]);
+
+  // Lazy-load older messages when the top sentinel scrolls into view.
+  useEffect(() => {
+    const sentinel = topSentinelRef.current;
+    const area = messagesAreaRef.current;
+    if (!sentinel || !area) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          loadOlderMessages();
+        }
+      },
+      { root: area, rootMargin: '200px 0px 0px 0px', threshold: 0 }
+    );
+    obs.observe(sentinel);
+    return () => obs.disconnect();
+  }, [hasMore, messages.length, loadingMore]);
 
   useEffect(() => {
     if (shouldScrollToBottomRef.current) {
@@ -1785,7 +1840,7 @@ function ChatThread({
             size={42}
           />
           <div className="thread-contact-meta">
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div className="thread-title-row">
               <h3 className="thread-contact-title">{contactName}</h3>
               {isRepeatedLead && (
                 <RepeatedIndicator collisionInfo={collisionTargets.join(' & ')} size="md" />
@@ -1797,7 +1852,7 @@ function ChatThread({
               )}
               {chat.isArchived && (
                 <span className="archived-badge">
-                  <ArchiveIcon size={12} style={{ marginRight: '4px' }} />
+                  <ArchiveIcon size={11} style={{ marginRight: '3px' }} />
                   Archived
                 </span>
               )}
@@ -1815,7 +1870,7 @@ function ChatThread({
             </div>
           </div>
         </div>
-        <div className="thread-header-actions" style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+        <div className="thread-header-actions">
           <button
             className={`secondary-btn small-btn ${isBlocked ? 'unblock-action-btn' : 'block-action-btn'}`}
             onClick={async () => {
@@ -1842,25 +1897,21 @@ function ChatThread({
             onClick={onToggleArchive}
             title={chat.isArchived ? 'Move to active chats' : 'Archive this conversation'}
           >
-            {chat.isArchived ? (
-              <>
-                <UnarchiveIcon size={13} style={{ marginRight: '4px' }} /> Unarchive
-              </>
-            ) : (
-              <>
-                <ArchiveIcon size={13} style={{ marginRight: '4px' }} /> Archive
-              </>
-            )}
+            {chat.isArchived ? <UnarchiveIcon size={13} /> : <ArchiveIcon size={13} />}
+            <span className="btn-label">{chat.isArchived ? 'Unarchive' : 'Archive'}</span>
           </button>
           <button className="secondary-btn small-btn" onClick={toggleNotes} title="Open lead notes">
-            <NotesIcon size={13} style={{ marginRight: '4px' }} /> Notes
+            <NotesIcon size={13} />
+            <span className="btn-label">Notes</span>
           </button>
         </div>
       </div>
 
       {isBlocked && (
         <div className="blocked-chat-alert-banner">
-          <span className="blocked-alert-icon">🚫</span>
+          <span className="blocked-alert-icon">
+            <AlertTriangleIcon size={16} />
+          </span>
           <div className="blocked-alert-content">
             <strong>Blocked Contact</strong>
             <span>Messages cannot be exchanged while blocked. Click "Unblock" above if you wish to resume chatting.</span>
@@ -1895,6 +1946,7 @@ function ChatThread({
       )}
 
       <div className="messages-area" ref={messagesAreaRef} aria-live="polite" aria-atomic="false">
+        {hasMore && <div ref={topSentinelRef} className="lazy-sentinel" aria-hidden="true" />}
         {hasMore && (
           <div className="load-older-banner">
             <button
@@ -1903,7 +1955,13 @@ function ChatThread({
               onClick={loadOlderMessages}
               disabled={loadingMore || loadingAll}
             >
-              {loadingMore ? '⏳ Loading earlier messages…' : `↑ Load Earlier Messages (${totalCount ? `${messages.length} of ${totalCount}` : `${messages.length} loaded`})`}
+              {loadingMore ? (
+                <>
+                  <span className="inline-btn-spinner" /> Loading earlier messages…
+                </>
+              ) : (
+                `Load earlier messages (${totalCount ? `${messages.length} of ${totalCount}` : `${messages.length} loaded`})`
+              )}
             </button>
             <button
               type="button"
@@ -1912,14 +1970,14 @@ function ChatThread({
               disabled={loadingMore || loadingAll}
               title="Load complete conversation history from the very beginning"
             >
-              {loadingAll ? '⚡ Loading entire chat…' : '⚡ Load Entire Chat'}
+              {loadingAll ? 'Loading entire chat…' : 'Load entire chat'}
             </button>
           </div>
         )}
 
         {!hasMore && messages.length > 0 && (
           <div className="chat-beginning-indicator">
-            <span>✨ Beginning of conversation ({messages.length} messages)</span>
+            <span>Beginning of conversation ({messages.length} messages)</span>
           </div>
         )}
 

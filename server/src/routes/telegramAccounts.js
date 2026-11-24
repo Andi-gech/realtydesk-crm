@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const TelegramAccount = require('../models/TelegramAccount');
 const { requireAuth } = require('../middleware/auth');
+const { deleteAccountData } = require('../services/cleanupService');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -120,6 +121,9 @@ router.delete('/:id', async (req, res) => {
     }
     account.status = 'revoked';
     await account.save();
+
+    // Cascade: remove this account's chats + messages so the admin view stays clean.
+    await deleteAccountData(req.auth.orgId, account._id);
 
     return res.json({ ok: true });
   } catch (err) {

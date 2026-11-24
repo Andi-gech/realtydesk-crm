@@ -12,6 +12,7 @@ import { TelegramClient } from 'telegram';
 import { syncAccountChats } from '../lib/telegramSync';
 import { saveSession } from '../lib/secureStorage';
 import { api } from '../api/client';
+import { RepeatIcon } from '../components/Icons';
 
 type Props = {
   onLinked: (telegramAccountId: string) => void;
@@ -281,34 +282,36 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
   return (
     <div className="add-telegram">
       <div className="card">
-        <h2>+ Add Telegram Account</h2>
+        <h1>Add a Telegram account</h1>
         <p className="subtitle">
-          Connect your Telegram account directly to sync messages with your team securely.
+          Link a Telegram account so its conversations sync to this workspace while the session
+          stays on this device.
         </p>
 
         {!telegramConfigured && (
-          <div className="info-banner" style={{ background: 'rgba(59, 130, 246, 0.1)', borderColor: 'rgba(59, 130, 246, 0.3)' }}>
-            <strong>Demo Simulation Mode:</strong> Telegram API credentials are not set in <code>client/.env</code>.
-            You can enter any phone number and any verification code to connect.
+          <div className="info-banner">
+            <strong>Demo simulation mode:</strong> Telegram API credentials are not set in{' '}
+            <code>client/.env</code>. You can enter any phone number and any verification code to
+            connect.
           </div>
         )}
 
         {/* Method Switcher Tabs (Only on initial step) */}
         {step === 'phone' && (
-          <div className="auth-method-tabs" style={{ display: 'flex', gap: '8px', marginBottom: '1.25rem' }}>
+          <div className="auth-method-tabs">
             <button
               type="button"
               className={`auth-tab-btn ${authMethod === 'phone' ? 'active' : ''}`}
               onClick={() => setAuthMethod('phone')}
             >
-              📱 Phone & Code (Recommended for PC)
+              Phone and code
             </button>
             <button
               type="button"
               className={`auth-tab-btn ${authMethod === 'qr' ? 'active' : ''}`}
               onClick={() => setAuthMethod('qr')}
             >
-              📷 Scan QR Code
+              Scan QR code
             </button>
           </div>
         )}
@@ -319,37 +322,38 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
             <div className="qr-code-box">
               {qrDataUrl ? (
                 <div className="qr-image-wrapper">
-                  <img src={qrDataUrl} alt="Telegram Login QR Code" className="qr-code-img" />
+                  <img src={qrDataUrl} alt="Telegram login QR code" className="qr-code-img" />
                 </div>
               ) : (
                 <div className="qr-loading-box">
-                  <span className="spinner" style={{ fontSize: '1.5rem', marginBottom: '8px' }}>⏳</span>
-                  <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                    Generating your Telegram login QR code...
-                  </p>
+                  <span className="spinner" />
+                  <p className="form-hint">Generating your Telegram login QR code…</p>
                 </div>
               )}
             </div>
 
             <div className="qr-instructions">
-              <h4 style={{ margin: '0 0 8px 0', fontSize: '0.92rem', color: 'var(--text-bright, #fff)' }}>
-                How to link via QR Code:
-              </h4>
-              <ol style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.86rem', lineHeight: '1.6', color: 'var(--text-muted, #94a3b8)' }}>
-                <li>Open <strong>Telegram</strong> on your phone</li>
-                <li>Go to <strong>Settings ➔ Devices ➔ Link Desktop Device</strong></li>
-                <li>Point your phone's camera at this QR code to login instantly</li>
+              <h4>How to link with a QR code</h4>
+              <ol>
+                <li>
+                  Open <strong>Telegram</strong> on your phone
+                </li>
+                <li>
+                  Go to <strong>Settings → Devices → Link Desktop Device</strong>
+                </li>
+                <li>Point your phone's camera at this code</li>
               </ol>
             </div>
 
-            <div className="button-group" style={{ marginTop: '1.25rem', display: 'flex', gap: '8px' }}>
+            <div className="button-group">
               <button
                 type="button"
                 className="secondary-btn"
                 onClick={initiateQrLogin}
                 disabled={qrLoading}
               >
-                🔄 Refresh QR Code
+                <RepeatIcon size={13} />
+                Refresh QR code
               </button>
               {onCancel && (
                 <button type="button" className="secondary-btn" onClick={onCancel} disabled={busy}>
@@ -364,10 +368,8 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
         {step === 'phone' && authMethod === 'phone' && (
           <form onSubmit={handleRequestCode}>
             <label>
-              Telegram Phone Number
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'block', marginTop: '2px' }}>
-                Include country code (e.g. +1 for US, +251 for Ethiopia, +44 for UK)
-              </span>
+              Telegram phone number
+              <span className="form-hint">Include the country code, for example +1 or +44.</span>
               <input
                 type="tel"
                 placeholder="+1 555 123 4567"
@@ -379,7 +381,7 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
             </label>
             <div className="button-group">
               <button type="submit" className="primary-btn" disabled={busy}>
-                {busy ? 'Connecting to Telegram…' : 'Send Code'}
+                {busy ? 'Connecting to Telegram…' : 'Send code'}
               </button>
               {onCancel && (
                 <button type="button" className="secondary-btn" onClick={onCancel} disabled={busy}>
@@ -393,43 +395,24 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
         {/* STEP 2: Verification Code */}
         {step === 'code' && (
           <form onSubmit={handleVerifyCode}>
-            <div
-              className="info-banner"
-              style={{
-                background: isCodeViaApp ? 'rgba(16, 185, 129, 0.1)' : 'rgba(59, 130, 246, 0.1)',
-                borderColor: isCodeViaApp ? 'rgba(16, 185, 129, 0.3)' : 'rgba(59, 130, 246, 0.3)',
-                padding: '0.85rem 1rem',
-                borderRadius: '8px',
-                marginBottom: '1rem',
-                fontSize: '0.88rem',
-                lineHeight: 1.45,
-              }}
-            >
+            <div className={`info-banner ${isCodeViaApp ? 'is-success' : ''}`}>
+              <strong>{isCodeViaApp ? 'Check the Telegram app' : 'Check your SMS'}</strong>
+              <br />
               {isCodeViaApp ? (
                 <>
-                  <div style={{ fontWeight: 600, color: 'var(--text-bright, #fff)', marginBottom: '4px' }}>
-                    📱 Check your Telegram App
-                  </div>
-                  <div>
-                    Telegram sent the login code to your <strong>Telegram app</strong> on your phone or computer,{' '}
-                    <em>not via SMS</em>. Please open Telegram to find the code from the official Telegram service notifications.
-                  </div>
+                  Telegram sent the login code to your <strong>Telegram app</strong>, not by SMS.
+                  Open Telegram and read the code in the official service chat.
                 </>
               ) : (
                 <>
-                  <div style={{ fontWeight: 600, color: 'var(--text-bright, #fff)', marginBottom: '4px' }}>
-                    💬 Check your SMS
-                  </div>
-                  <div>
-                    Telegram sent an SMS with your verification code to{' '}
-                    <strong>{maskPhone(authDataRef.current?.phoneNumber || phoneNumber)}</strong>.
-                  </div>
+                  Telegram sent an SMS with your code to{' '}
+                  <strong>{maskPhone(authDataRef.current?.phoneNumber || phoneNumber)}</strong>.
                 </>
               )}
             </div>
 
             <label>
-              Verification Code
+              Verification code
               <input
                 type="text"
                 inputMode="numeric"
@@ -437,20 +420,15 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
                 value={codeInput}
                 onChange={(e) => setCodeInput(e.target.value)}
                 placeholder="12345"
-                style={{
-                  fontSize: '1.25rem',
-                  letterSpacing: '4px',
-                  fontWeight: 600,
-                  textAlign: 'center',
-                }}
+                className="code-input"
                 required
                 autoFocus
               />
             </label>
 
-            <div className="button-group" style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
-              <button type="submit" className="primary-btn" disabled={busy} style={{ flex: 1 }}>
-                {busy ? 'Verifying…' : 'Verify & Link'}
+            <div className="button-group">
+              <button type="submit" className="primary-btn" disabled={busy}>
+                {busy ? 'Verifying…' : 'Verify and link'}
               </button>
               <button
                 type="button"
@@ -458,7 +436,7 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
                 onClick={handleBackToPhone}
                 disabled={busy}
               >
-                ← Change Phone
+                Change number
               </button>
             </div>
           </form>
@@ -467,35 +445,26 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
         {/* STEP 3: 2-Step Cloud Password */}
         {step === 'password' && (
           <form onSubmit={handleVerifyPassword}>
-            <div
-              className="info-banner"
-              style={{
-                background: 'rgba(234, 179, 8, 0.1)',
-                borderColor: 'rgba(234, 179, 8, 0.3)',
-                padding: '0.85rem 1rem',
-                borderRadius: '8px',
-                marginBottom: '1rem',
-                fontSize: '0.88rem',
-              }}
-            >
-              🔒 <strong>Two-Step Verification Enabled:</strong> Your Telegram account is protected by an additional cloud password.
+            <div className="info-banner is-notice">
+              <strong>Two-step verification is on.</strong> This account is protected by a cloud
+              password in addition to the login code.
             </div>
 
             <label>
-              2-Step Verification Password
+              2-step verification password
               <input
                 type="password"
                 value={passwordInput}
                 onChange={(e) => setPasswordInput(e.target.value)}
-                placeholder="Enter your cloud password"
+                placeholder="Cloud password"
                 required
                 autoFocus
               />
             </label>
 
-            <div className="button-group" style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
-              <button type="submit" className="primary-btn" disabled={busy} style={{ flex: 1 }}>
-                {busy ? 'Confirming…' : 'Confirm Password'}
+            <div className="button-group">
+              <button type="submit" className="primary-btn" disabled={busy}>
+                {busy ? 'Confirming…' : 'Confirm password'}
               </button>
               <button
                 type="button"
@@ -503,20 +472,20 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
                 onClick={() => setStep('code')}
                 disabled={busy}
               >
-                ← Back
+                Back
               </button>
             </div>
           </form>
         )}
 
         {statusMessage && (
-          <div className="info-banner" style={{ marginTop: '1rem', textAlign: 'center' }}>
-            <span className="spinner" style={{ marginRight: '8px' }}>⏳</span>
-            {statusMessage}
+          <div className="info-banner is-progress" role="status">
+            <span className="spinner" />
+            <span>{statusMessage}</span>
           </div>
         )}
 
-        {error && <div className="error-box" style={{ marginTop: '1rem' }}>{error}</div>}
+        {error && <div className="error-box">{error}</div>}
 
         {/* Connection log (collapsed by default; expand for troubleshooting) */}
         <div className="telegram-live-debug-terminal">
@@ -533,7 +502,7 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
                 disabled={logs.length === 0}
                 title="Copy all logs to clipboard"
               >
-                {copiedLogs ? '✓ Copied' : 'Copy'}
+                {copiedLogs ? 'Copied' : 'Copy'}
               </button>
               <button
                 type="button"

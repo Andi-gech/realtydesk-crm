@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api } from '../api/client';
 import { saveAuthTokens } from '../lib/secureStorage';
+import BrandMark from '../components/BrandMark';
 
 type Props = { onLoggedIn: (role: 'agent' | 'owner') => void };
 
@@ -47,7 +48,7 @@ export default function Login({ onLoggedIn }: Props) {
     setError(null);
     setLoading(true);
     try {
-      const { accessToken, refreshToken } = await api.ownerLogin(email.trim(), password);
+      const { accessToken, refreshToken } = await api.ownerLogin(email.trim(), password.trim());
       await saveAuthTokens(accessToken, refreshToken);
       onLoggedIn('owner');
     } catch (err: any) {
@@ -59,151 +60,181 @@ export default function Login({ onLoggedIn }: Props) {
 
   return (
     <div className="login-screen-wrapper">
-      <div className="card login-card">
-        <div className="login-brand">
-          <div className="brand-logo">🏢</div>
-          <h1>RealtyDesk CRM</h1>
-          <p className="subtitle">Real Estate Team Communications on Telegram</p>
+      <section className="login-brand-panel">
+        <div className="login-brand-lockup">
+          <BrandMark size={26} className="brand-mark" />
+          <span className="brand-name">RealtyDesk</span>
         </div>
 
-        <div className="tabs role-tabs">
-          <button
-            type="button"
-            className={mode === 'agent' ? 'active' : ''}
-            onClick={() => {
-              setMode('agent');
-              setError(null);
-            }}
-          >
-            Sub-User / Agent
-          </button>
-          <button
-            type="button"
-            className={mode === 'owner' ? 'active' : ''}
-            onClick={() => {
-              setMode('owner');
-              setError(null);
-            }}
-          >
-            Owner / Admin
-          </button>
-        </div>
+        <p className="login-statement">
+          <span>Every lead,</span>
+          <span>one desk.</span>
+        </p>
 
-        {mode === 'agent' ? (
-          <form onSubmit={submitAgent}>
-            {!useCodeMode ? (
-              <>
-                <label>
-                  Username
-                  <input
-                    placeholder="e.g. sarah_agent"
-                    value={agentUsername}
-                    onChange={(e) => setAgentUsername(e.target.value)}
-                    required
-                    autoFocus
-                  />
-                </label>
-                <label>
-                  Password
-                  <input
-                    type="password"
-                    placeholder="••••••••"
-                    value={agentPassword}
-                    onChange={(e) => setAgentPassword(e.target.value)}
-                    required
-                  />
-                </label>
-                <button type="submit" className="primary-btn" disabled={loading}>
-                  {loading ? 'Signing in…' : 'Sign in as Sub-User'}
-                </button>
-                <div style={{ marginTop: '0.8rem', textAlign: 'center', fontSize: '0.82rem' }}>
-                  <button
-                    type="button"
-                    className="text-btn"
-                    style={{ color: 'var(--primary, #3b82f6)', textDecoration: 'underline', background: 'none', border: 'none', cursor: 'pointer' }}
-                    onClick={() => {
-                      setUseCodeMode(true);
-                      setError(null);
-                    }}
-                  >
-                    Have an activation code instead? Click here
-                  </button>
-                </div>
-                <p className="form-hint" style={{ marginTop: '0.5rem' }}>
-                  Sub-user credentials are created by your Brokerage Admin in the Owner dashboard.
-                </p>
-              </>
-            ) : (
-              <>
-                <label>
-                  Brokerage Activation Code
-                  <input
-                    placeholder="Enter 10-character code"
-                    value={code}
-                    onChange={(e) => setCode(e.target.value)}
-                    required
-                    autoFocus
-                  />
-                </label>
-                <label>
-                  Your Full Name
-                  <input
-                    placeholder="e.g. Sarah Jenkins"
-                    value={displayName}
-                    onChange={(e) => setDisplayName(e.target.value)}
-                    required
-                  />
-                </label>
-                <button type="submit" className="primary-btn" disabled={loading}>
-                  {loading ? 'Validating Code…' : 'Join with Code'}
-                </button>
-                <div style={{ marginTop: '0.8rem', textAlign: 'center', fontSize: '0.82rem' }}>
-                  <button
-                    type="button"
-                    className="text-btn"
-                    style={{ color: 'var(--primary, #3b82f6)', textDecoration: 'underline', background: 'none', border: 'none', cursor: 'pointer' }}
-                    onClick={() => {
-                      setUseCodeMode(false);
-                      setError(null);
-                    }}
-                  >
-                    ← Back to Username & Password
-                  </button>
-                </div>
-              </>
-            )}
-          </form>
-        ) : (
-          <form onSubmit={submitOwner}>
-            <label>
-              Owner / Admin Email
-              <input
-                type="email"
-                placeholder="owner@example.com"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                required
-                autoFocus
-              />
-            </label>
-            <label>
-              Password
-              <input
-                type="password"
-                placeholder="••••••••"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-              />
-            </label>
-            <button type="submit" className="primary-btn" disabled={loading}>
-              {loading ? 'Authenticating…' : 'Sign in as Owner / Admin'}
+        <ul className="login-notes">
+          <li>
+            <span>Telegram connection</span>
+            <strong>On this device only</strong>
+          </li>
+          <li>
+            <span>Conversations</span>
+            <strong>Shared with the team</strong>
+          </li>
+          <li>
+            <span>Lead notes</span>
+            <strong>Kept on file</strong>
+          </li>
+        </ul>
+      </section>
+
+      <section className="login-form-panel">
+        <div className="login-card">
+          <div className="login-brand">
+            <h1>{mode === 'agent' ? 'Sign in' : 'Owner sign in'}</h1>
+            <p className="subtitle">
+              {mode === 'agent'
+                ? 'Use the credentials your brokerage admin gave you.'
+                : 'Use the email and password for this brokerage.'}
+            </p>
+          </div>
+
+          <div className="tabs role-tabs">
+            <button
+              type="button"
+              className={mode === 'agent' ? 'active' : ''}
+              onClick={() => {
+                setMode('agent');
+                setError(null);
+              }}
+            >
+              Sub-user / Agent
             </button>
-          </form>
-        )}
+            <button
+              type="button"
+              className={mode === 'owner' ? 'active' : ''}
+              onClick={() => {
+                setMode('owner');
+                setError(null);
+              }}
+            >
+              Owner / Admin
+            </button>
+          </div>
 
-        {error && <div className="error-box">{error}</div>}
-      </div>
+          {mode === 'agent' ? (
+            <form onSubmit={submitAgent}>
+              {!useCodeMode ? (
+                <>
+                  <label>
+                    Username
+                    <input
+                      placeholder="e.g. sarah_agent"
+                      value={agentUsername}
+                      onChange={(e) => setAgentUsername(e.target.value)}
+                      required
+                      autoFocus
+                    />
+                  </label>
+                  <label>
+                    Password
+                    <input
+                      type="password"
+                      placeholder="••••••••"
+                      value={agentPassword}
+                      onChange={(e) => setAgentPassword(e.target.value)}
+                      required
+                    />
+                  </label>
+                  <button type="submit" className="primary-btn" disabled={loading}>
+                    {loading ? 'Signing in…' : 'Sign in'}
+                  </button>
+                  <p className="login-alt">
+                    <button
+                      type="button"
+                      className="text-btn"
+                      onClick={() => {
+                        setUseCodeMode(true);
+                        setError(null);
+                      }}
+                    >
+                      Have an activation code?
+                    </button>
+                  </p>
+                  <p className="form-hint">
+                    Sub-user credentials are created by your brokerage admin in Organization admin.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <label>
+                    Brokerage activation code
+                    <input
+                      placeholder="10-character code"
+                      value={code}
+                      onChange={(e) => setCode(e.target.value)}
+                      required
+                      autoFocus
+                    />
+                  </label>
+                  <label>
+                    Your full name
+                    <input
+                      placeholder="e.g. Sarah Jenkins"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      required
+                    />
+                  </label>
+                  <button type="submit" className="primary-btn" disabled={loading}>
+                    {loading ? 'Validating code…' : 'Join with code'}
+                  </button>
+                  <p className="login-alt">
+                    <button
+                      type="button"
+                      className="text-btn"
+                      onClick={() => {
+                        setUseCodeMode(false);
+                        setError(null);
+                      }}
+                    >
+                      Back to username and password
+                    </button>
+                  </p>
+                </>
+              )}
+            </form>
+          ) : (
+            <form onSubmit={submitOwner}>
+              <label>
+                Owner / admin email
+                <input
+                  type="email"
+                  placeholder="owner@example.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  autoFocus
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  placeholder="••••••••"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                />
+              </label>
+              <button type="submit" className="primary-btn" disabled={loading}>
+                {loading ? 'Authenticating…' : 'Sign in'}
+              </button>
+            </form>
+          )}
+
+          {error && <div className="error-box">{error}</div>}
+        </div>
+      </section>
     </div>
   );
 }

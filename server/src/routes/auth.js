@@ -1,10 +1,11 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
+const { requireAuth } = require('../middleware/auth');
 
 const ActivationCode = require('../models/ActivationCode');
 const Agent = require('../models/Agent');
-const Owner = require('../models/Owner');
+const { deleteAgentChatsOnLogout } = require('../services/cleanupService');
 const { signAccessToken, signRefreshToken, verifyRefreshToken } = require('../services/tokenService');
 
 const router = express.Router();
@@ -141,11 +142,28 @@ router.post('/agent/login', loginLimiter, async (req, res) => {
   }
 });
 
+router.post('/logout', requireAuth, async (req, res) => {
+  try {
+    if (req.auth.role === 'agent') {
+      await deleteAgentChatsOnLogout(req.auth.orgId, req.auth.sub);
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[auth] logout error:', err.message);
+    return res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
+// Refresh: verify the agent still exists so a deleted agent is forced out.
 router.post('/refresh', async (req, res) => {
   const { refreshToken } = req.body || {};
   if (!refreshToken) return res.status(400).json({ error: 'refreshToken is required' });
   try {
     const decoded = verifyRefreshToken(refreshToken);
+    if (decoded.role === 'agent') {
+      const agent = await Agent.findOne({ _id: decoded.sub, orgId: decoded.orgId });
+      if (!agent) return res.status(401).json({ error: 'Account no longer exists' });
+    }
     const payload = { sub: decoded.sub, role: decoded.role, orgId: decoded.orgId };
     return res.json({ accessToken: signAccessToken(payload) });
   } catch (err) {

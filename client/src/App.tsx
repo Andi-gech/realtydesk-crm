@@ -4,11 +4,16 @@ import AddTelegram from './screens/AddTelegram';
 import Inbox from './screens/Inbox';
 import OwnerAdmin from './screens/OwnerAdmin';
 import { loadAuthTokens, clearAuthTokens, deleteSession } from './lib/secureStorage';
-import { api, tryRefresh } from './api/client';
+import { api, tryRefresh, registerAuthFailureHandler } from './api/client';
 import { SettingsIcon } from './components/Icons';
+import BrandMark from './components/BrandMark';
 
 type Role = 'agent' | 'owner';
 type View = 'inbox' | 'add_telegram' | 'owner_admin';
+
+/** The three real things boot does, in order. Nothing decorative. */
+const BOOT_STAGES = ['Reading local keychain', 'Refreshing session', 'Loading workspace'];
+const BOOT_PROGRESS = [0.16, 0.52, 0.86];
 
 function parseJwtPayload(token: string): any {
   try {
@@ -34,10 +39,29 @@ export default function App() {
   const [currentView, setCurrentView] = useState<View>('inbox');
   const [hasLinkedTelegram, setHasLinkedTelegram] = useState(false);
   const [checkingAuth, setCheckingAuth] = useState(true);
+  const [bootStage, setBootStage] = useState(0);
+  const [bootStalled, setBootStalled] = useState(false);
+
+  // Force logout if the server rejects our session (e.g. admin deleted the account).
+  useEffect(() => {
+    registerAuthFailureHandler(() => {
+      clearAuthTokens().finally(() => {
+        setRole(null);
+        setHasLinkedTelegram(false);
+        setCurrentView('inbox');
+      });
+    });
+    return () => registerAuthFailureHandler(() => {});
+  }, []);
 
   // Auto-restore session on boot with reliable token refresh
   useEffect(() => {
     let active = true;
+
+    // Honest escape hatch if the network hangs — the bar stops moving, so offer a way out.
+    const stallTimer = setTimeout(() => {
+      if (active) setBootStalled(true);
+    }, 4000);
 
     // Safety watchdog: ensure splash never hangs indefinitely
     const watchdog = setTimeout(() => {
@@ -51,6 +75,7 @@ export default function App() {
       try {
         const { accessToken: initialAccessToken, refreshToken } = await loadAuthTokens();
         let accessToken = initialAccessToken;
+        if (active) setBootStage(1);
 
         // Auto-refresh access token if expired or about to expire within 30s
         if (refreshToken) {
@@ -69,6 +94,8 @@ export default function App() {
             }
           }
         }
+
+        if (active) setBootStage(2);
 
         if (accessToken && active) {
           const payload = parseJwtPayload(accessToken);
@@ -100,6 +127,7 @@ export default function App() {
         console.warn('[App] Session restoration failed:', err);
       } finally {
         clearTimeout(watchdog);
+        clearTimeout(stallTimer);
         if (active) {
           setCheckingAuth(false);
         }
@@ -111,10 +139,13 @@ export default function App() {
     return () => {
       active = false;
       clearTimeout(watchdog);
+      clearTimeout(stallTimer);
     };
   }, []);
 
   async function handleLogout() {
+    // Tell the server to drop this agent's chats/history so the admin view stays clean.
+    try { await api.logout(); } catch { /* best effort */ }
     // Drop local MTProto sessions so the disconnected accounts are gone.
     try {
       const { telegramAccounts } = await api.myTelegramAccounts();
@@ -154,20 +185,31 @@ export default function App() {
 
   if (checkingAuth) {
     return (
-      <div className="loading-screen">
-        <div className="spinner"></div>
-        <p>Initializing RealtyDesk…</p>
-        <button
-          onClick={() => {
-            clearAuthTokens().finally(() => {
-              setRole(null);
-              setCheckingAuth(false);
-            });
-          }}
-          className="reset-session-btn"
-        >
-          Taking longer than usual? Click to reset session
-        </button>
+      <div className="loading-screen" role="status" aria-live="polite">
+        <BrandMark size={46} className="boot-mark" title="RealtyDesk" />
+        <div className="boot-copy">
+          <div className="boot-wordmark">RealtyDesk</div>
+          <p className="boot-stage">{BOOT_STAGES[bootStage]}</p>
+        </div>
+        <div className="boot-progress" aria-hidden="true">
+          <div
+            className="boot-progress-fill"
+            style={{ '--boot-progress': String(BOOT_PROGRESS[bootStage]) } as React.CSSProperties}
+          />
+        </div>
+        {bootStalled && (
+          <button
+            onClick={() => {
+              clearAuthTokens().finally(() => {
+                setRole(null);
+                setCheckingAuth(false);
+              });
+            }}
+            className="boot-reset"
+          >
+            Taking longer than usual? Reset session
+          </button>
+        )}
       </div>
     );
   }
@@ -185,10 +227,10 @@ export default function App() {
           onClick={() => setCurrentView('inbox')}
           title={role === 'owner' ? 'RealtyDesk - Click to return to Inbox' : 'RealtyDesk'}
         >
-          <span className="brand-icon">🏢</span>
+          <BrandMark size={20} className="brand-mark" />
           <span className="brand-name">RealtyDesk</span>
-          <span className={`role-badge ${role}`}>{role === 'owner' ? 'Owner Mode' : 'Agent Mode'}</span>
         </button>
+        <span className={`role-badge ${role}`}>{role === 'owner' ? 'Owner' : 'Agent'}</span>
 
         <nav className="header-nav">
           {role === 'owner' && (
@@ -196,8 +238,8 @@ export default function App() {
               className={`nav-btn ${currentView === 'owner_admin' ? 'active' : ''}`}
               onClick={() => setCurrentView(currentView === 'owner_admin' ? 'inbox' : 'owner_admin')}
             >
-              <SettingsIcon size={16} />
-              <span>{currentView === 'owner_admin' ? '← Back to Chats' : 'Organization Admin'}</span>
+              <SettingsIcon size={15} />
+              <span>{currentView === 'owner_admin' ? 'Back to inbox' : 'Organization admin'}</span>
             </button>
           )}
         </nav>

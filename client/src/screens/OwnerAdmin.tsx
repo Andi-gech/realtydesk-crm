@@ -106,16 +106,22 @@ export default function OwnerAdmin() {
   return (
     <div className="owner-admin">
       <div className="admin-header">
-        <h2>Organization Management</h2>
+        <h1>Organization</h1>
+        <p className="subtitle">
+          Sub-users, activation codes and cross-agent duplicate leads for this brokerage.
+        </p>
         <div className="admin-tabs">
           <button className={tab === 'agents' ? 'active' : ''} onClick={() => setTab('agents')}>
-            👥 Sub-Users / Agents ({agents.length})
+            Sub-users
+            <span className="tab-count">{agents.length}</span>
           </button>
           <button className={tab === 'duplicates' ? 'active' : ''} onClick={() => setTab('duplicates')}>
-            🔄 Duplicate Leads ({duplicateChats.length})
+            Duplicate leads
+            <span className="tab-count">{duplicateChats.length}</span>
           </button>
           <button className={tab === 'codes' ? 'active' : ''} onClick={() => setTab('codes')}>
-            🔑 Activation Codes ({activationCodes.length})
+            Activation codes
+            <span className="tab-count">{activationCodes.length}</span>
           </button>
         </div>
       </div>
@@ -127,13 +133,14 @@ export default function OwnerAdmin() {
       {tab === 'agents' && (
         <div className="admin-content">
           <div className="card code-generator-card">
-            <h3>+ Create New Sub-User (Agent)</h3>
+            <h3>Create a sub-user</h3>
             <p className="subtitle">
-              Create login credentials for sales agents or team members. Sub-users can only view and manage their own chats, while Admin can access all.
+              Give a sales agent their own login. Sub-users see only their own chats; the owner
+              sees every chat in the brokerage.
             </p>
-            <form onSubmit={handleCreateAgent} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem', marginTop: '1rem' }}>
+            <form onSubmit={handleCreateAgent} className="inline-form admin-create-form">
               <label>
-                Agent Full Name
+                Full name
                 <input
                   placeholder="e.g. Sarah Jenkins"
                   value={newDisplayName}
@@ -160,23 +167,23 @@ export default function OwnerAdmin() {
                   required
                 />
               </label>
-              <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-                <button type="submit" className="primary-btn" disabled={creatingAgent} style={{ width: '100%', height: '42px' }}>
-                  {creatingAgent ? 'Creating…' : '+ Create Sub-User'}
+              <div className="form-submit">
+                <button type="submit" className="primary-btn" disabled={creatingAgent}>
+                  {creatingAgent ? 'Creating…' : 'Create sub-user'}
                 </button>
               </div>
             </form>
           </div>
 
           <div className="card">
-            <h3>Team Members & Sub-Users</h3>
+            <h3>Team members</h3>
             <table className="admin-table">
               <thead>
                 <tr>
-                  <th>Agent Name</th>
+                  <th>Name</th>
                   <th>Username</th>
-                  <th>Role & Access</th>
-                  <th>Linked Telegram Accounts</th>
+                  <th>Access</th>
+                  <th>Telegram accounts</th>
                   <th>Created</th>
                   <th>Actions</th>
                 </tr>
@@ -185,7 +192,7 @@ export default function OwnerAdmin() {
                 {agents.length === 0 ? (
                   <tr>
                     <td colSpan={6} className="empty-cell">
-                      No sub-users created yet. Use the form above to add your first sales agent.
+                      No sub-users yet. Create one above to give an agent their own login.
                     </td>
                   </tr>
                 ) : (
@@ -198,27 +205,24 @@ export default function OwnerAdmin() {
                         <code className="code-badge">@{a.username || 'code-user'}</code>
                       </td>
                       <td>
-                        <span className="status-pill active" style={{ background: 'rgba(59, 130, 246, 0.1)', color: '#2563eb' }}>
-                          Own Chats Only
-                        </span>
+                        <span className="status-pill">Own chats only</span>
                       </td>
                       <td>
                         {a.telegramAccounts && a.telegramAccounts.length > 0 ? (
                           a.telegramAccounts.map((tg: any) => (
-                            <span key={tg.id} style={{ display: 'inline-block', background: '#f1f5f9', padding: '2px 8px', borderRadius: '4px', fontSize: '11px', margin: '2px' }}>
-                              📱 {tg.displayName || tg.phoneMasked || 'Telegram'}
+                            <span key={tg.id} className="code-badge account-chip">
+                              {tg.displayName || tg.phoneMasked || 'Telegram'}
                             </span>
                           ))
                         ) : (
-                          <span style={{ color: '#94a3b8', fontSize: '12px' }}>None linked yet</span>
+                          <span className="cell-muted">None linked</span>
                         )}
                       </td>
                       <td>{new Date(a.createdAt).toLocaleDateString()}</td>
                       <td>
                         <button
                           type="button"
-                          className="secondary-btn small-btn"
-                          style={{ color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.3)' }}
+                          className="secondary-btn small-btn danger-btn"
                           onClick={() => handleDeleteAgent(a.id, a.displayName)}
                         >
                           Delete
@@ -237,13 +241,14 @@ export default function OwnerAdmin() {
       {tab === 'codes' && (
         <div className="admin-content">
           <div className="card code-generator-card">
-            <h3>Generate Team Activation Code</h3>
+            <h3>Generate an activation code</h3>
             <p className="subtitle">
-              Alternative invite option: agents can use this code to self-enroll into your organization.
+              An alternative to creating the login yourself: an agent redeems the code to enroll in
+              this brokerage.
             </p>
             <form onSubmit={handleCreateCode} className="inline-form">
               <label>
-                Max Uses:
+                Max uses
                 <input
                   type="number"
                   min="1"
@@ -253,14 +258,16 @@ export default function OwnerAdmin() {
                   required
                 />
               </label>
-              <button type="submit" className="primary-btn" disabled={loading}>
-                {loading ? 'Generating…' : 'Generate Code'}
-              </button>
+              <div className="form-submit">
+                <button type="submit" className="primary-btn" disabled={loading}>
+                  {loading ? 'Generating…' : 'Generate code'}
+                </button>
+              </div>
             </form>
           </div>
 
           <div className="card">
-            <h3>Active Activation Codes</h3>
+            <h3>Activation codes</h3>
             <table className="admin-table">
               <thead>
                 <tr>
@@ -274,7 +281,7 @@ export default function OwnerAdmin() {
                 {activationCodes.length === 0 ? (
                   <tr>
                     <td colSpan={4} className="empty-cell">
-                      No activation codes found. Generate one above to invite agents.
+                      No activation codes yet. Generate one above to invite an agent.
                     </td>
                   </tr>
                 ) : (
@@ -285,12 +292,12 @@ export default function OwnerAdmin() {
                         <td>
                           <code className="code-badge">{c.code}</code>
                         </td>
-                        <td>
+                        <td className="num">
                           {c.usesCount} / {c.maxUses}
                         </td>
                         <td>
                           <span className={`status-pill ${isExhausted ? 'exhausted' : 'active'}`}>
-                            {isExhausted ? 'Used Up' : 'Active'}
+                            {isExhausted ? 'Used up' : 'Active'}
                           </span>
                         </td>
                         <td>{new Date(c.createdAt).toLocaleDateString()}</td>
@@ -308,24 +315,25 @@ export default function OwnerAdmin() {
       {tab === 'duplicates' && (
         <div className="admin-content">
           <div className="card">
-            <h3>Cross-Agent Duplicate Leads</h3>
+            <h3>Cross-agent duplicate leads</h3>
             <p className="subtitle">
-              Leads that have been contacted by multiple sales agents across your brokerage.
+              Leads that more than one agent has contacted. Agree who owns the follow-up before
+              replying.
             </p>
             <table className="admin-table">
               <thead>
                 <tr>
-                  <th>Contact Identifier</th>
-                  <th>Current Agent</th>
-                  <th>Last Message</th>
-                  <th>Last Active</th>
+                  <th>Contact</th>
+                  <th>Current agent</th>
+                  <th>Last message</th>
+                  <th>Last active</th>
                 </tr>
               </thead>
               <tbody>
                 {duplicateChats.length === 0 ? (
                   <tr>
                     <td colSpan={4} className="empty-cell">
-                      No duplicate leads detected. Great work keeping prospect coverage distinct!
+                      No duplicate leads detected.
                     </td>
                   </tr>
                 ) : (
@@ -337,7 +345,7 @@ export default function OwnerAdmin() {
                       </td>
                       <td>{c.agentId?.displayName || 'Unassigned'}</td>
                       <td>{c.lastMessagePreview || 'No messages'}</td>
-                      <td>{c.lastMessageAt ? new Date(c.lastMessageAt).toLocaleString() : '-'}</td>
+                      <td>{c.lastMessageAt ? new Date(c.lastMessageAt).toLocaleString() : '—'}</td>
                     </tr>
                   ))
                 )}
