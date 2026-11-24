@@ -8,41 +8,34 @@ try {
   // fallback to system resolver
 }
 
+let cachedPromise = null;
+
 async function connectDb() {
+  if (mongoose.connection.readyState === 1) return mongoose.connection;
+  if (cachedPromise) return cachedPromise;
+
   const uri = process.env.MONGO_URI;
   if (!uri || uri.includes('<username>') || uri.includes('<password>')) {
     throw new Error(
-      'Invalid MONGO_URI in server/.env.\n' +
-      'Please open server/.env and replace MONGO_URI with your MongoDB Atlas connection string.'
+      'Invalid MONGO_URI. Set MONGO_URI in your environment (e.g. Vercel project settings).'
     );
   }
 
   mongoose.set('strictQuery', true);
 
-  mongoose.connection.on('connected', () => {
-    console.log('[db] MongoDB connection established');
-  });
-
-  mongoose.connection.on('error', (err) => {
-    console.error('[db] MongoDB connection error:', err.message || err);
-  });
-
-  mongoose.connection.on('disconnected', () => {
-    console.warn('[db] MongoDB disconnected, attempting auto-reconnect...');
-  });
-
-  try {
-    await mongoose.connect(uri, {
-      family: 4,
-      serverSelectionTimeoutMS: 15000,
-      socketTimeoutMS: 45000,
-    });
+  cachedPromise = mongoose.connect(uri, {
+    family: 4,
+    serverSelectionTimeoutMS: 15000,
+    socketTimeoutMS: 45000,
+  }).then((conn) => {
     console.log(`[db] Connected to MongoDB: ${mongoose.connection.host || 'remote cluster'}`);
-    return mongoose.connection;
-  } catch (err) {
-    console.error(`[db] MongoDB connection error: ${err.message}`);
+    return conn;
+  }).catch((err) => {
+    cachedPromise = null;
     throw err;
-  }
+  });
+
+  return cachedPromise;
 }
 
 module.exports = { connectDb };

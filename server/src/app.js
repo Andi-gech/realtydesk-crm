@@ -3,6 +3,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 
+const { connectDb } = require('./config/db');
+
 const authRoutes = require('./routes/auth');
 const ownerRoutes = require('./routes/owner');
 const telegramAccountRoutes = require('./routes/telegramAccounts');
@@ -11,12 +13,22 @@ const chatRoutes = require('./routes/chats');
 const contactRoutes = require('./routes/contacts');
 const templateRoutes = require('./routes/templates');
 
+const allowedOrigin = process.env.CORS_ORIGIN || process.env.CLIENT_ORIGIN;
+
 function createApp() {
   const app = express();
 
   app.use(helmet());
-  const allowedOrigin = process.env.CORS_ORIGIN || process.env.CLIENT_ORIGIN;
-app.use(cors(allowedOrigin ? { origin: allowedOrigin, credentials: true } : undefined));
+  app.use(cors(allowedOrigin ? { origin: allowedOrigin, credentials: true } : undefined));
+  // Ensure DB is connected (cached) before handling any request — important on serverless cold starts.
+  app.use(async (req, res, next) => {
+    try {
+      await connectDb();
+      next();
+    } catch (err) {
+      res.status(503).json({ error: 'Database unavailable: ' + (err.message || err) });
+    }
+  });
   // mediaRef data URLs (photos) are stored on messages; keep the cap generous
   // but finite (MongoDB's default max document size is 16 MB).
   app.use(express.json({ limit: '16mb' }));
