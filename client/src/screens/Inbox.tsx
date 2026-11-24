@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { api } from '../api/client';
 import { Avatar } from '../components/Avatar';
 import { getCachedAvatar, subscribeAvatarUpdates } from '../lib/avatarCache';
+import { deleteSession } from '../lib/secureStorage';
 import {
   getLiveClient,
   fetchLiveTelegramChats,
@@ -646,6 +647,10 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   const handleUnlink = async (id: string, name: string) => {
     if (!window.confirm(`Are you sure you want to disconnect Telegram account "${name}"?`)) return;
     try {
+      // Drop the local MTProto session too — the account is revoked, so its
+      // keychain entry should not linger (the session is only usable on this
+      // device anyway).
+      await deleteSession(id);
       await api.unlinkTelegramAccount(id);
       await fetchAccounts();
       loadChats(false);
@@ -737,7 +742,17 @@ export default function Inbox({ role, onAddTelegram }: Props) {
 
     // Poll every 30 s so the badge stays current across all agents in the org
     pollTimer = setInterval(() => {
-      if (!isCancelled) fetchRepeatedIds();
+      if (isCancelled) return;
+      fetchRepeatedIds();
+      // Owner view is pull-based: the server is served via Vercel, which has
+      // no long-lived connections, so refresh the org-wide chat list on a
+      // poll instead of using a WebSocket.
+      if (role === 'owner') {
+        api
+          .listChats({ scope, includeArchived: true })
+          .then((res) => setChats(res.chats || []))
+          .catch(() => {});
+      }
     }, 30_000);
 
     (async () => {
@@ -1639,6 +1654,8 @@ function ChatThread({
             if (prev.some((m) => String(m.telegramMessageId) === msgId)) return prev;
             return [...prev, liveMsg];
           });
+          // Mirror to the server so the owner's poll-based view sees it too.
+          mirrorLiveChatToCRM(chatAccountId, chat, [liveMsg]).catch(() => {});
         }
       });
     }

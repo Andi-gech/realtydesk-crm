@@ -200,8 +200,9 @@ export async function submitTelegramCode(
     const telegramUserId = String(user.id);
     log(`Code successfully accepted by Telegram! Authenticated User ID: ${telegramUserId} (${user.firstName || ''} ${user.lastName || ''} @${user.username || 'no-username'})`, 'success');
     const sessionString = client.session.save() as unknown as string;
-    await saveSession(telegramUserId, sessionString);
-    log(`Encrypted MTProto session key stored locally for user ${telegramUserId}`, 'success');
+    // Session is saved locally by AddTelegram.finalizeLink(), keyed by the
+    // server account id (reconnect() uses the same id).
+    log(`Authenticated as ${telegramUserId}.`, 'success');
 
     return {
       success: true,
@@ -272,8 +273,9 @@ export async function submitTelegram2FAPassword(
     const telegramUserId = String(user.id);
     log(`2FA Password verified! Authenticated User ID: ${telegramUserId} (${user.firstName || ''} ${user.lastName || ''})`, 'success');
     const sessionString = client.session.save() as unknown as string;
-    await saveSession(telegramUserId, sessionString);
-    log(`Saved persistent session string for user ${telegramUserId}`, 'success');
+    // Session is saved locally by AddTelegram.finalizeLink(), keyed by the
+    // server account id (reconnect() uses the same id).
+    log(`2FA verified for user ${telegramUserId}.`, 'success');
 
     return {
       success: true,
@@ -370,8 +372,9 @@ export async function startTelegramQrLogin(
 
   const telegramUserId = String(authUser.id);
   const sessionString = client.session.save() as unknown as string;
+  // Session is saved locally by AddTelegram.finalizeLink(), keyed by the
+  // server account id (reconnect() uses the same id).
   log(`QR Code successfully scanned! Authenticated User: ${authUser.firstName || ''} ${authUser.lastName || ''} (@${authUser.username || 'no-username'}) ID: ${telegramUserId}`, 'success');
-  await saveSession(telegramUserId, sessionString);
 
   return {
     client,

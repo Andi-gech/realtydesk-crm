@@ -3,7 +3,7 @@ import Login from './screens/Login';
 import AddTelegram from './screens/AddTelegram';
 import Inbox from './screens/Inbox';
 import OwnerAdmin from './screens/OwnerAdmin';
-import { loadAuthTokens, clearAuthTokens } from './lib/secureStorage';
+import { loadAuthTokens, clearAuthTokens, deleteSession } from './lib/secureStorage';
 import { api, tryRefresh } from './api/client';
 import { SettingsIcon } from './components/Icons';
 
@@ -116,6 +116,13 @@ export default function App() {
   }, []);
 
   async function handleLogout() {
+    // Drop local MTProto sessions so the disconnected accounts are gone.
+    try {
+      const { telegramAccounts } = await api.myTelegramAccounts();
+      await Promise.all((telegramAccounts || []).map((a: any) => deleteSession(a._id)));
+    } catch {
+      // Not signed in / no accounts — nothing to clean.
+    }
     await clearAuthTokens();
     setRole(null);
     setHasLinkedTelegram(false);

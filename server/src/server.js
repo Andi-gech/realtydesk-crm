@@ -32,15 +32,10 @@ async function purgeLegacyTelegramSessions() {
   }
 }
 
+const app = createApp();
+
 async function main() {
   validateTokenSecrets();
-
-  const app = createApp();
-  const port = process.env.PORT || 4000;
-
-  app.listen(port, () => {
-    console.log(`[server] RealtyDesk API listening on port ${port}`);
-  });
 
   console.log('[server] Connecting to database...');
   try {
@@ -55,3 +50,14 @@ main().catch((err) => {
   console.error('[server] fatal startup error:', err.message || err);
   process.exit(1);
 });
+
+// Vercel (serverless) runs this module as the request handler — export the app
+// and do NOT open a listener. Local/standalone runs (`npm start`) listen on PORT.
+module.exports = app;
+
+if (require.main === module) {
+  const port = process.env.PORT || 4000;
+  app.listen(port, () => {
+    console.log(`[server] RealtyDesk API listening on port ${port}`);
+  });
+}

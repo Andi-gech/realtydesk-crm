@@ -9,7 +9,7 @@ owner — connects their own Telegram account directly via MTProto.
 architecture, data model, API contract, and the one security rule
 (§2) that every feature must respect: *the server never holds a usable
 Telegram credential for anyone.* Agents can link multiple personal
-accounts; the owner can see every synced conversation and jump in with
+accounts; the owssner can see every synced conversation and jump in with
 replies sent through the **owner's own** linked account — never by
 taking over an agent's session.
 

@@ -17,5 +17,6 @@ const messageSchema = new Schema(
 );
 
 messageSchema.index({ chatId: 1, telegramMessageId: 1 }, { unique: true });
+messageSchema.index({ chatId: 1, sentAt: -1 });
 
 module.exports = model('Message', messageSchema);

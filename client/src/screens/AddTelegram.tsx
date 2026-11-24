@@ -233,12 +233,22 @@ export default function AddTelegram({ onLinked, onCancel }: Props) {
       }
     } catch {}
 
-    const linkRes = await api.linkTelegramAccount({
-      telegramUserId,
-      displayName: tgDisplayName || `Account ${maskPhone(phoneStr)}`,
-      username: tgUsername,
-      phoneMasked: maskPhone(phoneStr),
-    });
+    let linkRes;
+    try {
+      linkRes = await api.linkTelegramAccount({
+        telegramUserId,
+        displayName: tgDisplayName || `Account ${maskPhone(phoneStr)}`,
+        username: tgUsername,
+        phoneMasked: maskPhone(phoneStr),
+      });
+    } catch (linkErr: any) {
+      // e.g. the account is already linked in this org — surface it instead
+      // of dumping the user back on the code step.
+      setError(linkErr?.message || 'Failed to link Telegram account');
+      setStatusMessage(null);
+      setBusy(false);
+      return;
+    }
 
     const serverAccountId = linkRes.telegramAccount?._id || telegramUserId;
     const accountOwnerType = linkRes.telegramAccount?.ownerType === 'owner' ? 'owner' : 'agent';

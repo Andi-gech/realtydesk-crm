@@ -16,7 +16,9 @@ function createApp() {
 
   app.use(helmet());
   app.use(cors());
-  app.use(express.json({ limit: '2mb' }));
+  // mediaRef data URLs (photos) are stored on messages; keep the cap generous
+  // but finite (MongoDB's default max document size is 16 MB).
+  app.use(express.json({ limit: '16mb' }));
   app.use(morgan('tiny'));
 
   app.get('/health', (req, res) => res.json({ ok: true, service: 'realtydesk-server' }));
