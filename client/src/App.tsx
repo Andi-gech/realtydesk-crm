@@ -179,16 +179,16 @@ export default function App() {
   return (
     <div className="app-shell">
       <header className="app-header">
-        <div
+        <button
+          type="button"
           className="brand"
           onClick={() => setCurrentView('inbox')}
-          style={{ cursor: role === 'owner' ? 'pointer' : 'default' }}
           title={role === 'owner' ? 'RealtyDesk - Click to return to Inbox' : 'RealtyDesk'}
         >
           <span className="brand-icon">🏢</span>
           <span className="brand-name">RealtyDesk</span>
           <span className={`role-badge ${role}`}>{role === 'owner' ? 'Owner Mode' : 'Agent Mode'}</span>
-        </div>
+        </button>
 
         <nav className="header-nav">
           {role === 'owner' && (

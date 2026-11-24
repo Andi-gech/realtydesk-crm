@@ -20,7 +20,7 @@
   --border: #e6e8eb;
   --text-main: #111827;
   --text-muted: #707579;
-  --danger: #e53935;
+  --danger: #c0392b;
   --danger-bg: #fdeeed;
   --warning: #f59e0b;
   --warning-bg: #fffbeb;
@@ -96,6 +96,15 @@ body,
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  background: none;
+  border: none;
+  padding: 0.25rem 0.5rem;
+  cursor: pointer;
+}
+
+.brand:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .brand-icon {
@@ -710,8 +719,8 @@ select:focus {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   border-radius: 5px;
   background: rgba(245, 158, 11, 0.12);
   border: 1px solid rgba(245, 158, 11, 0.28);
@@ -1309,7 +1318,9 @@ select:focus {
   border: none;
   color: #94a3b8;
   font-size: 0.75rem;
-  padding: 0.2rem 0.4rem;
+  padding: 0.5rem 0.5rem;
+  min-height: 28px;
+  min-width: 28px;
   border-radius: 4px;
   cursor: pointer;
   transition: all 0.15s ease;
@@ -1432,6 +1443,7 @@ select:focus {
   max-height: 280px;
   object-fit: cover;
   display: block;
+  aspect-ratio: 16 / 9;
   transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -2211,7 +2223,7 @@ select:focus {
   color: #ffffff;
   font-size: 1.1rem;
   cursor: pointer;
-  padding: 4px;
+  padding: 8px;
   line-height: 1;
   opacity: 0.8;
   transition: opacity 0.15s;

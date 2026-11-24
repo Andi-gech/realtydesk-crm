@@ -145,7 +145,7 @@ function ContactNotesDrawer({
         <div className="notes-drawer-header">
           <div>
             <h3>Lead Dossier & Notes</h3>
-            <span className="contact-subtitle">
+            <span>
               {contactInfo?.savedName || contactInfo?.displayName || 'Lead Notes'}
             </span>
           </div>
@@ -1016,11 +1016,20 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                   <div
                     key={acc._id}
                     className={`tg-drawer-account-item ${selectedAccountId === acc._id ? 'selected' : ''}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Select ${acc.displayName || acc.phoneMasked || acc.telegramUserId}`}
                     onClick={() => {
                       setSelectedAccountId(acc._id);
                       setDrawerOpen(false);
                     }}
-                    style={{ cursor: 'pointer' }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedAccountId(acc._id);
+                        setDrawerOpen(false);
+                      }
+                    }}
                   >
                     <div className="tg-drawer-account-left">
                       <Avatar
@@ -1885,7 +1894,7 @@ function ChatThread({
         </div>
       )}
 
-      <div className="messages-area" ref={messagesAreaRef}>
+      <div className="messages-area" ref={messagesAreaRef} aria-live="polite" aria-atomic="false">
         {hasMore && (
           <div className="load-older-banner">
             <button
@@ -1938,7 +1947,7 @@ function ChatThread({
                   <div className="placeholder-icon-wrap">
                     <PhotoIcon size={20} className="placeholder-icon" />
                   </div>
-                  <span className="placeholder-text">Photo</span>
+                  <span>Photo</span>
                 </div>
               ) : null}
               {m.text && m.text !== '[Media]' && m.text !== '[Photo]' && !m.text.startsWith('[Photo') && (
