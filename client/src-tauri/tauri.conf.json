@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM0N0U0OEFEODNDRTc5RjgKUldUNGVjNkRyVWgrTkZVQkRGRkpwTnZZa2F3Zm1ucXc1QjBCTCs5UHlDVzVjQUwyeDNUajJ5U3cK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENEOTY2ODIzNjNDNjg3MDEKUldRQmg4WmpJMmlXemVIZHI2alM1TTA0Vk96b1NobDFxZ2IwTm9LanNlS0krZzlMd1l6VUkrK1MK",
       "endpoints": [
         "https://github.com/newtoktoklast-rgb/realtydesk-crm/releases/latest/download/latest.json"
       ]
