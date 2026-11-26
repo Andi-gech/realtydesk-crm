@@ -4,6 +4,7 @@ import { api } from '../api/client';
 import { Avatar } from '../components/Avatar';
 import BrandMark from '../components/BrandMark';
 import { getCachedAvatar, subscribeAvatarUpdates, bufferToDataUrl } from '../lib/avatarCache';
+import { translateText, getTargetLanguage } from '../lib/translation';
 import { deleteSession } from '../lib/secureStorage';
 import { destroyTelegramClient } from '../lib/telegram';
 import {
@@ -1343,6 +1344,43 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               </div>
             )}
 
+            <div className="tg-drawer-section">
+              <div className="tg-drawer-section-title">
+                <span>Translation</span>
+              </div>
+              <select
+                className="tg-search-input"
+                style={{ width: '100%' }}
+                defaultValue={(() => { try { return localStorage.getItem('rd_translation_lang') || ''; } catch { return ''; } })()}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  try {
+                    if (v) localStorage.setItem('rd_translation_lang', v);
+                    else localStorage.removeItem('rd_translation_lang');
+                    Object.keys(localStorage).filter((k) => k.startsWith('rd_tr_')).forEach((k) => localStorage.removeItem(k));
+                  } catch {}
+                }}
+              >
+                <option value="">Auto (device language)</option>
+                <option value="en">English</option>
+                <option value="zh">Chinese (Simplified)</option>
+                <option value="ru">Russian</option>
+                <option value="es">Spanish</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="ar">Arabic</option>
+                <option value="tr">Turkish</option>
+                <option value="hi">Hindi</option>
+                <option value="ja">Japanese</option>
+                <option value="ko">Korean</option>
+                <option value="pt">Portuguese</option>
+                <option value="it">Italian</option>
+              </select>
+              <p style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                Incoming messages are translated automatically. Unlimited, no quota.
+              </p>
+            </div>
+
             {onAddTelegram && (
               <button
                 className="secondary-btn small-btn full-width drawer-add-account"
@@ -1743,6 +1781,7 @@ function ChatThread({
   onBack: () => void;
 }) {
   const [messages, setMessages] = useState<any[]>([]);
+  const [translations, setTranslations] = useState<Record<string, string>>({});
   const [loadingMessages, setLoadingMessages] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadingAll, setLoadingAll] = useState(false);
@@ -1780,6 +1819,31 @@ function ChatThread({
   // Each conversation must be read/sent through the MTProto client that owns it.
   const chatAccountId = String(chat.telegramAccountId?._id || chat.telegramAccountId || '');
   const [chatClient, setChatClient] = useState<TelegramClient | null>(null);
+
+  // Auto-translate incoming messages into the agent's target language.
+  useEffect(() => {
+    const target = getTargetLanguage();
+    const pending = messages.filter((m) => {
+      if (m.direction !== 'in') return false;
+      if (!m.text || m.text.startsWith('[')) return false;
+      const id = String(m._id || m.telegramMessageId || '');
+      return id && translations[id] === undefined;
+    });
+    if (pending.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      for (const m of pending) {
+        if (cancelled) return;
+        const id = String(m._id || m.telegramMessageId || '');
+        const tr = await translateText(m.text, target);
+        if (cancelled) return;
+        setTranslations((prev) => ({ ...prev, [id]: tr && tr !== m.text ? tr : '' }));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [messages, translations]);
 
   // Outgoing messages belong to the viewer only when this chat's account is one
   // of their own linked accounts. Otherwise they were sent by the account owner.
@@ -2359,6 +2423,12 @@ function ChatThread({
               {m.text && m.text !== '[Media]' && m.text !== '[Photo]' && !m.text.startsWith('[Photo') && (
                 <p className="bubble-text">{m.text}</p>
               )}
+              {m.direction === 'in' && (() => {
+                const id = String(m._id || m.telegramMessageId || '');
+                const tr = id ? translations[id] : undefined;
+                if (!tr) return null;
+                return <p className="bubble-text bubble-translation">{tr}</p>;
+              })()}
               <div className="bubble-footer">
                 <span className="msg-time">
                   {new Date(m.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
