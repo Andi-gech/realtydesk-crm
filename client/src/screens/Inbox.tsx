@@ -14,6 +14,7 @@ import {
   subscribeLiveTelegramUpdates,
   chatMatchesPeer,
   buildLiveChatFromPeer,
+  saveContactToTelegram,
   mirrorLiveChatToCRM,
   LiveChat,
   LiveMessage,
@@ -1035,6 +1036,24 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           for (const { acc, dialogs } of liveResults) {
             if (isCancelled || dialogs.length === 0) continue;
             try {
+              // Auto-save unsaved contacts to the Telegram address book as well
+              // (agent opt-in), keeping the agent's phone number hidden.
+              try {
+                if (localStorage.getItem('rd_auto_save_contacts') === '1') {
+                  const cl = await getLiveClient(acc._id);
+                  if (cl) {
+                    const preset = localStorage.getItem('rd_contact_preset') || '';
+                    for (const d of dialogs) {
+                      if (isCancelled) break;
+                      if (d.contactId?.savedName) continue; // already saved in Telegram
+                      const firstName = d.contactId?.firstName || '';
+                      const lastName = [d.contactId?.lastName, preset].filter(Boolean).join(' ').trim();
+                      if (!firstName && !lastName) continue;
+                      await saveContactToTelegram(cl, d.entity, firstName, lastName, d.contactId?.phoneNumber);
+                    }
+                  }
+                }
+              } catch {}
               const items = dialogs.map((d) => ({
                 chatExternalId: d.externalChatId,
                 contact: {

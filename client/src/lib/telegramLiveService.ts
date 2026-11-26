@@ -535,6 +535,57 @@ export function subscribeLiveTelegramUpdates(
  * client messaging for the first time). Fetching the entity lets the inbox
  * show the conversation instantly instead of waiting for a full dialog reload.
  */
+const TELEGRAM_SAVED_CONTACTS_KEY = 'rd_telegram_saved_contacts';
+
+function getTelegramSavedContactSet(): Set<string> {
+  try {
+    const raw = localStorage.getItem(TELEGRAM_SAVED_CONTACTS_KEY);
+    if (raw) return new Set(JSON.parse(raw));
+  } catch {}
+  return new Set();
+}
+
+function markTelegramContactSaved(tgUserId: string): void {
+  try {
+    const set = getTelegramSavedContactSet();
+    set.add(tgUserId);
+    localStorage.setItem(TELEGRAM_SAVED_CONTACTS_KEY, JSON.stringify([...set]));
+  } catch {}
+}
+
+export async function saveContactToTelegram(
+  client: TelegramClient,
+  entity: any,
+  firstName: string,
+  lastName: string,
+  phone?: string
+): Promise<boolean> {
+  if (!client || !client.connected || !entity) return false;
+  if (entity?.self) return true;
+  if (entity?.contact) return true;
+  const tgId = entity?.id ? String(entity.id) : '';
+  if (tgId && getTelegramSavedContactSet().has(tgId)) return true;
+
+  try {
+    const inputUser = await client.getInputEntity(entity);
+    const resolvedPhone = (phone || entity?.phone || '').toString().replace(/^\+/, '');
+    await client.invoke(
+      new Api.contacts.AddContact({
+        id: inputUser,
+        firstName: (firstName || '').trim() || 'Contact',
+        lastName: (lastName || '').trim(),
+        phone: resolvedPhone,
+        addPhonePrivacyException: false,
+      })
+    );
+    if (tgId) markTelegramContactSaved(tgId);
+    return true;
+  } catch (err: any) {
+    console.warn('[telegramLiveService] AddContact failed:', err?.errorMessage || err?.message || err);
+    return false;
+  }
+}
+
 export async function buildLiveChatFromPeer(
   client: TelegramClient,
   telegramAccountId: string,
@@ -615,6 +666,21 @@ export async function mirrorLiveChatToCRM(
   messages: LiveMessage[] = []
 ): Promise<void> {
   try {
+    // Auto-save to Telegram address book as well (agent opt-in), hiding the
+    // agent's phone number from the contact.
+    try {
+      if (localStorage.getItem('rd_auto_save_contacts') === '1' && !chat.contactId?.savedName && chat.entity) {
+        const preset = localStorage.getItem('rd_contact_preset') || '';
+        const firstName = chat.contactId?.firstName || '';
+        const lastName = [chat.contactId?.lastName, preset].filter(Boolean).join(' ').trim();
+        if (firstName || lastName) {
+          const cl = await getLiveClient(telegramAccountId);
+          if (cl) {
+            await saveContactToTelegram(cl, chat.entity, firstName, lastName, chat.contactId?.phoneNumber);
+          }
+        }
+      }
+    } catch {}
     await api.syncMessages({
       telegramAccountId,
       chatExternalId: chat.externalChatId,
