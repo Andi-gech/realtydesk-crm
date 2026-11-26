@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "RealtyDesk",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.realtydesk.crm",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENEOTY2ODIzNjNDNjg3MDEKUldRQmg4WmpJMmlXemVIZHI2alM1TTA0Vk96b1NobDFxZ2IwTm9LanNlS0krZzlMd1l6VUkrK1MK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgwMkUzNTI2QjczOUJGRTMKUldUanZ6bTNKalV1Z05HTkk0K005VWtnVEl3NlRzOWhMcXdOY3B5L1hBUnFkZk85R0JPSVQxQmEK",
       "endpoints": [
         "https://github.com/newtoktoklast-rgb/realtydesk-crm/releases/latest/download/latest.json"
       ]
