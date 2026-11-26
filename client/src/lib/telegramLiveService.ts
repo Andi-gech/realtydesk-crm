@@ -62,6 +62,32 @@ const withTimeout = <T>(promise: Promise<T>, ms = 4000): Promise<T | null> =>
     new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
   ]);
 
+/** Returns true when text contains a Telegram link (e.g. t.me/... or https://t.me/...). */
+export function containsTmeLink(text?: string | null): boolean {
+  if (!text) return false;
+  return /(?:https?:\/\/)?t\.me\//i.test(text);
+}
+
+/**
+ * Lightweight MTProto search for any message containing "t.me/" in a chat.
+ * Propagates FLOOD_WAIT errors so callers can pause rate-limited scans.
+ */
+export async function searchChatForTmeLink(
+  client: TelegramClient,
+  peer: any
+): Promise<boolean> {
+  if (!client || !client.connected || !peer) return false;
+  const resolvedPeer =
+    typeof peer === 'string' && /^-?\d+$/.test(peer.trim())
+      ? Number(peer.trim())
+      : peer;
+  const res: any = await client.getMessages(resolvedPeer, {
+    search: 't.me/',
+    limit: 1,
+  });
+  return Array.isArray(res) && res.length > 0;
+}
+
 /**
  * Connects to Telegram MTProto for the specified account and returns the active client.
  */
@@ -255,13 +281,21 @@ export async function fetchLiveTelegramMessages(
   } | number = 100,
   onMediaDownloaded?: (msgId: string, dataUrl: string) => void
 ): Promise<FetchMessagesResult> {
-  if (!client || !client.connected) return { messages: [], hasMore: false };
+  if (!client || !client.connected || !peer) return { messages: [], hasMore: false };
 
   const limit = typeof options === 'number' ? options : (options?.limit || 100);
   const offsetId = typeof options === 'object' ? options?.offsetId : undefined;
 
+  // GramJS treats numeric strings (e.g. "123456789" or "-1001234567890") as
+  // usernames unless converted to a number, which causes getMessages to fail
+  // when chat.entity isn't attached yet.
+  const resolvedPeer =
+    typeof peer === 'string' && /^-?\d+$/.test(peer.trim())
+      ? Number(peer.trim())
+      : peer;
+
   try {
-    const rawMessages: any = await client.getMessages(peer, {
+    const rawMessages: any = await client.getMessages(resolvedPeer, {
       limit,
       offsetId,
     });
@@ -567,7 +601,12 @@ export async function saveContactToTelegram(
   if (tgId && getTelegramSavedContactSet().has(tgId)) return true;
 
   try {
-    const inputUser = await client.getInputEntity(entity);
+    let inputUser: any;
+    if (entity?.id && entity?.accessHash) {
+      inputUser = new Api.InputUser({ userId: entity.id, accessHash: entity.accessHash });
+    } else {
+      inputUser = await client.getInputEntity(entity);
+    }
     const resolvedPhone = (phone || entity?.phone || '').toString().replace(/^\+/, '');
     await client.invoke(
       new Api.contacts.AddContact({
