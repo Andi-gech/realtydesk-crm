@@ -1425,6 +1425,7 @@ label > .form-hint {
   padding: 10px 10px 10px 12px;
   border-radius: var(--radius-card);
   cursor: pointer;
+  contain: layout paint style;
   content-visibility: auto;
   contain-intrinsic-size: 68px;
   transition: background-color 160ms ease;
@@ -2092,6 +2093,9 @@ label > .form-hint {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
+  contain: layout paint style;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
   animation: msg-in 170ms var(--ease-out) both;
 }
 
@@ -2726,6 +2730,9 @@ label > .form-hint {
   box-shadow: 0 18px 60px rgba(19, 20, 22, 0.18);
   transform: translateX(-102%);
   visibility: hidden;
+  will-change: transform;
+  backface-visibility: hidden;
+  contain: layout style;
   transition:
     transform var(--t-drawer) var(--ease-out),
     visibility var(--t-drawer);
@@ -2975,6 +2982,9 @@ label > .form-hint {
   background: var(--surface);
   border-left: 1px solid var(--border);
   box-shadow: -18px 0 50px rgba(19, 20, 22, 0.14);
+  will-change: transform;
+  backface-visibility: hidden;
+  contain: layout style;
   animation: drawer-in var(--t-drawer) var(--ease-out) both;
 }
 
@@ -3101,6 +3111,9 @@ label > .form-hint {
   border-radius: var(--radius-card);
   background: var(--surface);
   box-shadow: 0 22px 60px rgba(19, 20, 22, 0.24);
+  will-change: transform, opacity;
+  backface-visibility: hidden;
+  contain: layout style;
   animation: dialog-in 220ms var(--ease-out) both;
 }
 
@@ -3174,6 +3187,8 @@ label > .form-hint {
   border-radius: var(--radius-card);
   background: var(--surface);
   box-shadow: 0 14px 40px rgba(19, 20, 22, 0.16);
+  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: toast-in 260ms var(--ease-out) both;
 }
 

@@ -58,7 +58,7 @@ export async function syncAccountChats(
     onProgress?.(lastSync > 0 ? 'Checking for new Telegram messages...' : 'Fetching all dialogs from Telegram...');
 
     // Fetch up to 500 dialogs so no historical chats are omitted
-    const dialogs = await client.getDialogs({ limit: 500 });
+    const dialogs = (await withTimeout(client.getDialogs({ limit: 500 }), 20000)) || [];
 
     if (!dialogs || dialogs.length === 0) {
       onProgress?.('No dialogs found on Telegram.');
@@ -138,13 +138,9 @@ export async function syncAccountChats(
         // Fetch or load profile photo avatar
         let avatarUrl: string | undefined = getCachedAvatar(chatExternalId) || undefined;
         if (!avatarUrl && entity && (entity.photo || entity.className === 'User' || entity.className === 'Chat')) {
-          try {
-            const downloaded = await withTimeout(
-              downloadAndCacheAvatar(client, entity, chatExternalId),
-              1800
-            );
-            if (downloaded) avatarUrl = downloaded;
-          } catch {}
+          if (i < 20) {
+            downloadAndCacheAvatar(client, entity, chatExternalId).catch(() => {});
+          }
         }
 
         const contact = {
@@ -173,22 +169,23 @@ export async function syncAccountChats(
           sentAt: string;
         }> = [];
 
-        // For the first 15 active chats, fetch recent history (up to 25 messages)
-        if (i < 15) {
+        // For the first 10 active chats, fetch recent history (capped for low-network speed).
+        if (i < 10) {
           try {
             const rawMessages = await withTimeout(
-              client.getMessages(dialog.entity || dialog.inputEntity, { limit: 25 }),
+              client.getMessages(dialog.entity || dialog.inputEntity, { limit: 15 }),
               2500
             );
             if (rawMessages && Array.isArray(rawMessages)) {
               for (const m of rawMessages) {
                 if (!m || !m.id || (!m.message && !m.media)) continue;
                 let mediaRef: string | undefined = undefined;
-                if (m.media) {
+                // Download media only for a few recent messages to keep sync fast on low networks.
+                if (m.media && messages.filter((x) => x.mediaRef).length < 2) {
                   try {
                     const mediaBuf = await withTimeout(
                       client.downloadMedia(m, {}),
-                      3500
+                      2500
                     );
                     if (mediaBuf && (mediaBuf as any).length > 0) {
                       mediaRef = bufferToDataUrl(mediaBuf) || undefined;
@@ -216,11 +213,11 @@ export async function syncAccountChats(
         // Fallback to dialog's top message
         if (messages.length === 0 && dialog.message && dialog.message.id) {
           let topMediaRef: string | undefined = undefined;
-          if (dialog.message.media && i < 25) {
+          if (dialog.message.media && i < 10) {
             try {
               const topBuf = await withTimeout(
                 client.downloadMedia(dialog.message, {}),
-                2500
+                2000
               );
               if (topBuf && (topBuf as any).length > 0) {
                 topMediaRef = bufferToDataUrl(topBuf) || undefined;

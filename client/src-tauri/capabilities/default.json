@@ -7,6 +7,9 @@
     "core:default",
     "updater:default",
     "process:default",
-    "allow-keyring"
+    "notification:default",
+    "allow-keyring",
+    "allow-local-cache",
+    "allow-debug-log"
   ]
 }

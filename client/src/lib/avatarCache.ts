@@ -4,9 +4,12 @@
  * render instantly across component re-renders.
  */
 
+import { storeMediaDataUrl, isTauriEnvironment } from './mediaStore';
+
 const memoryCache = new Map<string, string>();
 const listeners = new Set<(id: string, dataUrl: string) => void>();
 const inFlight = new Map<string, Promise<string | null>>();
+const migrating = new Set<string>();
 
 export function subscribeAvatarUpdates(cb: (id: string, dataUrl: string) => void): () => void {
   listeners.add(cb);
@@ -51,6 +54,19 @@ export function getCachedAvatar(id?: string): string | null {
     const stored = localStorage.getItem(`realtydesk_av_${cleanId}`);
     if (stored) {
       memoryCache.set(cleanId, stored);
+      // Migrate legacy base64 avatars to the disk-backed media:// cache.
+      if (stored.startsWith('data:') && isTauriEnvironment() && !migrating.has(cleanId)) {
+        migrating.add(cleanId);
+        storeMediaDataUrl(`av_${cleanId}`, stored)
+          .then((url) => {
+            if (!url) return;
+            memoryCache.set(cleanId, url);
+            try { localStorage.setItem(`realtydesk_av_${cleanId}`, url); } catch {}
+            emitAvatarUpdate(cleanId, url);
+          })
+          .catch(() => {})
+          .finally(() => migrating.delete(cleanId));
+      }
       return stored;
     }
   } catch {}
@@ -65,6 +81,18 @@ export function setCachedAvatar(id: string, dataUrl: string): void {
     localStorage.setItem(`realtydesk_av_${cleanId}`, dataUrl);
   } catch {}
   emitAvatarUpdate(cleanId, dataUrl);
+
+  // Persist to disk so base64 never lingers in memory/localStorage.
+  if (isTauriEnvironment() && dataUrl.startsWith('data:')) {
+    storeMediaDataUrl(`av_${cleanId}`, dataUrl)
+      .then((url) => {
+        if (!url) return;
+        memoryCache.set(cleanId, url);
+        try { localStorage.setItem(`realtydesk_av_${cleanId}`, url); } catch {}
+        emitAvatarUpdate(cleanId, url);
+      })
+      .catch(() => {});
+  }
 }
 
 /**

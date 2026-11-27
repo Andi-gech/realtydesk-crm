@@ -1,11 +1,15 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
+import { Avatar } from '../components/Avatar';
+import { translateText, getTargetLanguage } from '../lib/translation';
 
 export default function OwnerAdmin() {
   const [tab, setTab] = useState<'agents' | 'codes' | 'duplicates'>('agents');
   const [agents, setAgents] = useState<any[]>([]);
   const [activationCodes, setActivationCodes] = useState<any[]>([]);
   const [duplicateChats, setDuplicateChats] = useState<any[]>([]);
+  const [translatedPreviews, setTranslatedPreviews] = useState<Record<string, string>>({});
+  const [loadingDuplicates, setLoadingDuplicates] = useState(false);
   const [maxUses, setMaxUses] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -20,8 +24,14 @@ export default function OwnerAdmin() {
   useEffect(() => {
     loadAgents();
     loadCodes();
-    loadDuplicates();
+    loadDuplicates(true);
   }, []);
+
+  useEffect(() => {
+    if (tab !== 'duplicates') return;
+    const t = setInterval(() => { loadDuplicates(false); }, 30000);
+    return () => clearInterval(t);
+  }, [tab]);
 
   async function loadAgents() {
     try {
@@ -41,14 +51,39 @@ export default function OwnerAdmin() {
     }
   }
 
-  async function loadDuplicates() {
+  async function loadDuplicates(showLoading = false) {
+    if (showLoading) setLoadingDuplicates(true);
     try {
       const res = await api.listChats({ scope: 'all', filter: 'repeated' });
       setDuplicateChats(res.chats || []);
     } catch (err: any) {
       console.warn('Failed to load duplicates:', err);
+    } finally {
+      if (showLoading) setLoadingDuplicates(false);
     }
   }
+
+  useEffect(() => {
+    const target = getTargetLanguage();
+    const pending = duplicateChats.filter((c) => {
+      const id = String(c._id || '');
+      const text = c.lastMessagePreview || '';
+      return id && text && !text.startsWith('[') && translatedPreviews[id] === undefined;
+    });
+    if (pending.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      for (const c of pending) {
+        if (cancelled) return;
+        const id = String(c._id || '');
+        const text = c.lastMessagePreview || '';
+        const tr = await translateText(text, target);
+        if (cancelled) return;
+        setTranslatedPreviews((prev) => ({ ...prev, [id]: tr && tr !== text ? tr : '' }));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [duplicateChats, translatedPreviews]);
 
   async function handleCreateAgent(e: React.FormEvent) {
     e.preventDefault();
@@ -315,39 +350,72 @@ export default function OwnerAdmin() {
       {tab === 'duplicates' && (
         <div className="admin-content">
           <div className="card">
-            <h3>Cross-agent duplicate leads</h3>
-            <p className="subtitle">
-              Leads that more than one agent has contacted. Agree who owns the follow-up before
-              replying.
-            </p>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
+              <div>
+                <h3>Cross-agent duplicate leads</h3>
+                <p className="subtitle">
+                  Leads that more than one agent has contacted. Agree who owns the follow-up before replying.
+                  Chats appear here after an agent’s app has synced them to the server.
+                </p>
+              </div>
+              <button className="secondary-btn" onClick={() => loadDuplicates(true)} disabled={loadingDuplicates}>
+                {loadingDuplicates ? 'Loading…' : 'Refresh'}
+              </button>
+            </div>
             <table className="admin-table">
               <thead>
                 <tr>
-                  <th>Contact</th>
+                  <th>Lead</th>
                   <th>Current agent</th>
                   <th>Last message</th>
                   <th>Last active</th>
                 </tr>
               </thead>
               <tbody>
-                {duplicateChats.length === 0 ? (
+                {loadingDuplicates ? (
+                  <tr>
+                    <td colSpan={4} className="empty-cell">
+                      <span className="inline-btn-spinner" /> Loading duplicate leads…
+                    </td>
+                  </tr>
+                ) : duplicateChats.length === 0 ? (
                   <tr>
                     <td colSpan={4} className="empty-cell">
                       No duplicate leads detected.
                     </td>
                   </tr>
                 ) : (
-                  duplicateChats.map((c) => (
-                    <tr key={c._id}>
-                      <td>
-                        <strong>{c.contactId?.username || c.contactId?.phoneNumber || 'Contact'}</strong>
-                        <span className="dup-badge">Repeated</span>
-                      </td>
-                      <td>{c.agentId?.displayName || 'Unassigned'}</td>
-                      <td>{c.lastMessagePreview || 'No messages'}</td>
-                      <td>{c.lastMessageAt ? new Date(c.lastMessageAt).toLocaleString() : '—'}</td>
-                    </tr>
-                  ))
+                  duplicateChats.map((c) => {
+                    const contact = c.contactId || {};
+                    const name =
+                      contact.savedName ||
+                      [contact.firstName, contact.lastName].filter(Boolean).join(' ').trim() ||
+                      contact.displayName ||
+                      contact.username ||
+                      contact.phoneNumber ||
+                      'Unknown';
+                    const preview = c.lastMessagePreview || '';
+                    const tr = translatedPreviews[String(c._id)] || '';
+                    return (
+                      <tr key={c._id}>
+                        <td>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <Avatar name={name} id={String(contact._id || c._id)} photoUrl={contact.avatarUrl} size={34} />
+                            <div style={{ display: 'flex', flexDirection: 'column' }}>
+                              <strong>{name}</strong>
+                              <span className="dup-badge">Repeated</span>
+                            </div>
+                          </div>
+                        </td>
+                        <td>{c.agentId?.displayName || 'Unassigned'}</td>
+                        <td>
+                          <div>{preview || 'No messages'}</div>
+                          {tr ? <div style={{ fontSize: 12, opacity: 0.75, fontStyle: 'italic' }}>{tr}</div> : null}
+                        </td>
+                        <td>{c.lastMessageAt ? new Date(c.lastMessageAt).toLocaleString() : '—'}</td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>

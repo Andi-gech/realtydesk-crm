@@ -8,6 +8,28 @@
       window.global = window;
       window.process = window.process || { env: {} };
       (function () {
+        // Earliest possible diagnostic: prove the HTML loaded and the Tauri IPC
+        // is reachable, independent of the bundled app code.
+        function diag(msg) {
+          try {
+            var internals = window.__TAURI_INTERNALS__;
+            if (internals && internals.invoke) {
+              internals.invoke('debug_log', { message: 'html: ' + msg });
+            }
+          } catch (e) {
+            /* never block page bootstrap */
+          }
+        }
+        diag('index.html executing, readyState=' + document.readyState);
+        window.addEventListener('error', function (e) {
+          diag('window error: ' + (e && e.message) + ' @ ' + (e && e.filename) + ':' + (e && e.lineno));
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          diag('rejection: ' + String(e && e.reason));
+        });
+        window.addEventListener('load', function () {
+          diag('window load fired, root children=' + (document.getElementById('root') || {}).childNodes);
+        });
         try {
           var t = localStorage.getItem('rd_theme') || 'dark';
           document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');

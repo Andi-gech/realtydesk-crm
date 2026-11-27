@@ -5,8 +5,19 @@ import { Avatar } from '../components/Avatar';
 import BrandMark from '../components/BrandMark';
 import { getCachedAvatar, subscribeAvatarUpdates, bufferToDataUrl } from '../lib/avatarCache';
 import { translateText, getTargetLanguage } from '../lib/translation';
-import { deleteSession } from '../lib/secureStorage';
+import { deleteSession, loadSession } from '../lib/secureStorage';
 import { destroyTelegramClient } from '../lib/telegram';
+import { storeMediaDataUrl } from '../lib/mediaStore';
+import { registerNotificationClickHandler, notifyNewMessage, sendTestNotification, forceTestNotification } from '../lib/notifications';
+import { useVirtualRows } from '../lib/useVirtualRows';
+import {
+  cacheChats as cacheChatsToDb,
+  loadCachedChats,
+  searchCachedChatIds,
+  cacheMessages as cacheMessagesToDb,
+  loadCachedMessages,
+  chatCacheKey,
+} from '../lib/localDb';
 import {
   getLiveClient,
   fetchLiveTelegramChats,
@@ -15,7 +26,7 @@ import {
   subscribeLiveTelegramUpdates,
   chatMatchesPeer,
   buildLiveChatFromPeer,
-  saveContactToTelegram,
+
   mirrorLiveChatToCRM,
   containsTmeLink,
   searchChatForTmeLink,
@@ -53,6 +64,41 @@ function formatTelegramTime(dateStr?: string) {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+const CHAT_CACHE_KEY = 'realtydesk_chats_cache_v1';
+
+/** Instant local-first chat list so the inbox paints before any network call. */
+function readCachedChats(): any[] {
+  try {
+    const raw = localStorage.getItem(CHAT_CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCachedChats(chats: any[]): void {
+  try {
+    const light = chats.slice(0, 500).map((chat: any) => {
+      const { entity, inputEntity, ...rest } = chat;
+      const contactId = rest.contactId
+        ? {
+            ...rest.contactId,
+            // Base64 avatars are already cached separately; don't duplicate them.
+            avatarUrl:
+              typeof rest.contactId.avatarUrl === 'string' &&
+              rest.contactId.avatarUrl.startsWith('data:')
+                ? undefined
+                : rest.contactId.avatarUrl,
+          }
+        : rest.contactId;
+      return { ...rest, contactId };
+    });
+    localStorage.setItem(CHAT_CACHE_KEY, JSON.stringify(light));
+  } catch {}
 }
 
 function ChatSkeletons({ count = 8 }: { count?: number }) {
@@ -294,7 +340,7 @@ function mergeLiveAndDbChats(liveChats: any[], dbChats: any[]): any[] {
 }
 
 type DraftAttachment = { file: File; dataUrl: string };
-type DraftEntry = { text: string; attachment: DraftAttachment | null };
+type DraftEntry = { text: string; attachments: DraftAttachment[] };
 
 /**
  * Per-conversation unsent drafts. ChatThread remounts when the selected chat
@@ -582,10 +628,16 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [isSearching, setIsSearching] = useState(false);
-  const [chats, setChats] = useState<any[]>([]);
-  const [loadingChats, setLoadingChats] = useState(true);
+  // Chat keys matched by SQLite FTS5 over cached chats + message bodies.
+  const [ftsChatIds, setFtsChatIds] = useState<Set<string>>(() => new Set());
+  const [chats, setChats] = useState<any[]>(readCachedChats);
+  const [loadingChats, setLoadingChats] = useState(() => chats.length === 0);
   const [scope, setScope] = useState<'mine' | 'all'>(role === 'owner' ? 'all' : 'mine');
-  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(() => {
+    if (typeof window !== 'undefined' && window.innerWidth < 900) return null;
+    const first = chats[0];
+    return first ? first._id || first.externalChatId : null;
+  });
   const [showNotes, setShowNotes] = useState(false);
   const [templates, setTemplates] = useState<any[]>([]);
   const [showTemplates, setShowTemplates] = useState(false);
@@ -604,14 +656,15 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   const unknownChatFetches = useRef<Set<string>>(new Set());
   // Latest chat list for use inside live-update handlers (which are bound once).
   const chatsRef = useRef<any[]>([]);
+  const chatListRef = useRef<HTMLUListElement | null>(null);
+  const chatCacheSigRef = useRef('');
   // Currently open conversation, so live messages there never show as unread.
   const selectedChatIdRef = useRef<string | null>(null);
+  const windowFocusedRef = useRef<boolean>(true);
   // Chats inserted from a live message before Telegram's dialog list catches up.
   // Kept briefly so a background refresh cannot make them disappear.
   const pendingNewChats = useRef<Map<string, { chat: any; at: number }>>(new Map());
-  // Agent setting: auto-save new contacts with a preset name.
-  const [autoSaveContacts, setAutoSaveContacts] = useState(false);
-  const [contactPreset, setContactPreset] = useState('');
+
   const [missingSessionAccounts, setMissingSessionAccounts] = useState<any[]>([]);
   const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null);
   const [transferScan, setTransferScan] = useState<{ done: number; total: number } | null>(null);
@@ -636,6 +689,22 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     selectedChatIdRef.current = selectedChatId;
   }, [selectedChatId]);
 
+  useEffect(() => {
+    const update = () => {
+      windowFocusedRef.current =
+        document.visibilityState === 'visible' && document.hasFocus();
+    };
+    update();
+    window.addEventListener('focus', update);
+    window.addEventListener('blur', update);
+    document.addEventListener('visibilitychange', update);
+    return () => {
+      window.removeEventListener('focus', update);
+      window.removeEventListener('blur', update);
+      document.removeEventListener('visibilitychange', update);
+    };
+  }, []);
+
   // Server-authoritative repeated-client detection
   // These come from /chats/repeated-ids which checks DB-stored chats across accounts in the org.
   const [serverRepeatedIds, setServerRepeatedIds] = useState<Set<string>>(new Set());
@@ -643,13 +712,17 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   const [serverRepeatedCount, setServerRepeatedCount] = useState<number>(0);
   // Monotonic counter so a stale repeated-ids response can't overwrite newer data.
   const repeatedFetchSeq = useRef(0);
+  const lastRepeatedFetchAtRef = useRef(0);
 
   // Stop applying responses after unmount.
   useEffect(() => () => {
     repeatedFetchSeq.current += 1;
   }, []);
 
-  const fetchRepeatedIds = useCallback(async () => {
+  const fetchRepeatedIds = useCallback(async (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastRepeatedFetchAtRef.current < 5000) return;
+    lastRepeatedFetchAtRef.current = now;
     const seq = ++repeatedFetchSeq.current;
     try {
       const res = await api.listRepeatedChatIds();
@@ -675,19 +748,44 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     return () => clearTimeout(timer);
   }, [query]);
 
+  // Local FTS5 search over the SQLite cache (desktop only). Runs after the
+  // debounce so fast typing doesn't hammer the database.
   useEffect(() => {
-    return subscribeAvatarUpdates(() => {
-      setAvatarRev((r) => r + 1);
-    });
+    const q = debouncedQuery.trim();
+    if (q.length < 2) {
+      setFtsChatIds((prev) => (prev.size === 0 ? prev : new Set()));
+      return;
+    }
+    let cancelled = false;
+    searchCachedChatIds(q)
+      .then((keys) => {
+        if (!cancelled) setFtsChatIds(new Set(keys));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [debouncedQuery, chats.length]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (window as any).__notifyTest = () => forceTestNotification();
+    // Diagnostic: proves the notification code path is reachable.
+    (async () => {
+      const { isTauri } = await import('@tauri-apps/api/core');
+      const tauri = isTauri();
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('debug_log', { message: `Inbox mounted, isTauri=${tauri}` }).catch(() => {});
+    })();
+    registerNotificationClickHandler((chatId) => {
+      if (chatId) setSelectedChatId(chatId);
+    }).then((u) => { unlisten = u; });
+    // One-shot diagnostic so the user can confirm OS notifications work.
+    sendTestNotification().catch(() => {});
+    return () => { if (unlisten) unlisten(); };
   }, []);
 
-  // Load agent auto-save contact settings from local storage.
-  useEffect(() => {
-    try {
-      setAutoSaveContacts(localStorage.getItem('rd_auto_save_contacts') === '1');
-      setContactPreset(localStorage.getItem('rd_contact_preset') || '');
-    } catch {}
-  }, []);
+
 
   // Fetch the signed-in user's own accounts plus the org-wide account directory.
   // Owners can see the whole directory; every user only ever syncs their own
@@ -822,9 +920,17 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     return merged;
   }, []);
 
+  const loadChatsInFlightRef = useRef(false);
+  const lastLoadChatsAtRef = useRef(0);
+
   // Refreshes the chat list. Each account is resolved to its own local MTProto
   // client, so chats always come from the account that actually owns them.
   const loadChats = useCallback(async (showLoading = false) => {
+    const now = Date.now();
+    if (loadChatsInFlightRef.current) return;
+    if (!showLoading && now - lastLoadChatsAtRef.current < 4000) return;
+    loadChatsInFlightRef.current = true;
+    lastLoadChatsAtRef.current = now;
     if (showLoading) setLoadingChats(true);
     try {
       const accounts = telegramAccounts.length > 0 ? telegramAccounts : await fetchAccounts();
@@ -833,7 +939,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         try {
           const accClient = await getLiveClient(acc._id);
           if (accClient && accClient.connected) {
-            const dialogs = await fetchLiveTelegramChats(accClient, acc._id, 300);
+            const dialogs = await fetchLiveTelegramChats(accClient, acc._id, 30);
             return {
               connected: true,
               chats: dialogs.map((d) => ({
@@ -874,6 +980,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     } catch (err) {
       console.warn('[Inbox] Error loading chats:', err);
     } finally {
+      loadChatsInFlightRef.current = false;
       if (showLoading) setLoadingChats(false);
     }
   }, [telegramAccounts, scope, debouncedQuery, fetchRepeatedIds, mergePendingNewChats]);
@@ -921,15 +1028,29 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     }, 30_000);
 
     (async () => {
-      const accounts = await fetchAccounts();
+      // Local-first: hydrate the durable SQLite cache in parallel with the
+      // account lookup so an offline launch still paints the inbox.
+      const [accounts, cachedChats] = await Promise.all([
+        fetchAccounts(),
+        loadCachedChats().catch(() => [] as any[]),
+      ]);
       if (isCancelled) return;
+      if (cachedChats.length > 0) {
+        setChats((prev) => (prev.length > 0 ? prev : mergePendingNewChats(cachedChats)));
+        setSelectedChatId((curr) => {
+          if (curr) return curr;
+          if (isNarrowViewport()) return null;
+          return cachedChats[0]._id || cachedChats[0].externalChatId || null;
+        });
+        setLoadingChats(false);
+      }
       if (accounts.length === 0) {
         setLiveStatus('offline');
-        setLoadingChats(false);
+        if (cachedChats.length === 0) setLoadingChats(false);
         return;
       }
 
-      setLoadingChats(true);
+      if (chats.length === 0 && cachedChats.length === 0) setLoadingChats(true);
       try {
         // 1. Show DB chats immediately so the inbox renders in ~300ms instead of
         // waiting for all Telegram MTProto sessions & dialogs to finish.
@@ -949,8 +1070,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           setLoadingChats(false);
         }
 
-        // 2. Connect each Telegram account & fetch its dialogs progressively
-        // so the first account's chats appear while remaining accounts load.
+        // 2. Connect each Telegram account in parallel for faster startup on low networks.
+        // Chats appear progressively as each account responds.
         const statuses = new Map<string, LiveStatus>();
         const publishStatus = () => {
           const values = [...statuses.values()];
@@ -963,8 +1084,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         const accumulatedLive: any[] = [];
         const liveResults: Array<{ acc: any; dialogs: any[]; cl: TelegramClient | null }> = [];
 
-        for (const acc of accounts) {
-          if (isCancelled) break;
+        const accountTasks = accounts.map(async (acc) => {
+          if (isCancelled) return { acc, dialogs: [] as any[], cl: null as TelegramClient | null, cleanup: () => {} };
           const accountId = String(acc._id);
           statuses.set(accountId, 'connecting');
           publishStatus();
@@ -976,7 +1097,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             if (cl && cl.connected) {
               statuses.set(accountId, 'live');
               publishStatus();
-              dialogs = await fetchLiveTelegramChats(cl, acc._id, 300);
+              dialogs = await fetchLiveTelegramChats(cl, acc._id, 30);
               const accountChats = dialogs.map((d) => ({
                 ...d,
                 telegramAccountId: acc._id,
@@ -993,12 +1114,15 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                   return merged.length > 0 ? merged[0]._id || merged[0].externalChatId : null;
                 });
               }
+            } else {
+              statuses.set(accountId, 'offline');
+              publishStatus();
             }
           } catch (err) {
+            statuses.set(accountId, 'offline');
+            publishStatus();
             console.warn(`[Inbox] Live fetch note for account ${acc._id}:`, err);
           }
-
-          liveResults.push({ acc, dialogs, cl });
 
           const cleanup = subscribeLiveTelegramUpdates(
             cl,
@@ -1032,6 +1156,22 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                   selectedChatIdRef.current === target._id ||
                   selectedChatIdRef.current === target.externalChatId;
                 mirrorLiveChatToCRM(accountId, target, [liveMsg]).catch(() => {});
+
+                // Desktop push notification for new incoming messages when the
+                // conversation isn't actively being viewed (or the window is
+                // hidden to the tray).
+                if (!isOut) {
+                  const windowFocused = windowFocusedRef.current;
+                  if (!isOpen || !windowFocused) {
+                    const chatName = getChatDisplayName(target);
+                    notifyNewMessage({
+                      title: chatName,
+                      body: text || (msg.media ? 'Photo' : 'New message'),
+                      chatId: String(target._id || target.externalChatId || ''),
+                    }).catch(() => {});
+                  }
+                }
+
                 if (isOpen && !isOut && target._id) {
                   api.markChatRead(target._id).catch(() => {});
                 }
@@ -1086,8 +1226,9 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                       if (exists) return prev;
                       return [newChat, ...prev];
                     });
-                    mirrorLiveChatToCRM(accountId, newChat, [liveMsg]).catch(() => {});
-                    fetchRepeatedIds();
+                    mirrorLiveChatToCRM(accountId, newChat, [liveMsg])
+                      .catch(() => {})
+                      .finally(() => { fetchRepeatedIds(true).catch(() => {}); });
                   }
                 } catch (err) {
                   console.warn('[Inbox] Could not load new chat:', err);
@@ -1113,22 +1254,65 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                 // Catch up on anything missed while the socket was down.
                 loadChats(false);
               },
+              onReadHistory: (peerIds, stillUnreadCount) => {
+                setChats((prev) => {
+                  let changed = false;
+                  const next = prev.map((c) => {
+                    if (!chatMatchesPeer(c, peerIds)) return c;
+                    const newUnread =
+                      typeof stillUnreadCount === 'number' ? stillUnreadCount : 0;
+                    if ((c.unreadCount || 0) === newUnread) return c;
+                    changed = true;
+                    // Mirror the read state to the CRM server so the org-wide
+                    // view (and other agents) stay consistent.
+                    if (newUnread === 0 && c._id) {
+                      api.markChatRead(c._id).catch(() => {});
+                    }
+                    return { ...c, unreadCount: newUnread };
+                  });
+                  return changed ? next : prev;
+                });
+              },
             }
           );
-          cleanups.push(cleanup);
+
+          return { acc, dialogs, cl, cleanup };
+        });
+
+        const settledResults = await Promise.allSettled(accountTasks);
+        for (const settled of settledResults) {
+          if (settled.status === 'fulfilled') {
+            const { acc, dialogs, cl, cleanup } = settled.value;
+            liveResults.push({ acc, dialogs, cl });
+            cleanups.push(cleanup);
+          }
         }
 
         if (isCancelled) return;
 
-        const missing = liveResults
-          .filter((r) => !r.cl || !r.cl.connected)
-          .map((r) => r.acc);
+        const disconnected = liveResults.filter((r) => !r.cl || !r.cl.connected);
+        const missingChecks = await Promise.all(
+          disconnected.map(async (r) => ({
+            acc: r.acc,
+            hasSession: Boolean(await loadSession(String(r.acc._id)).catch(() => null)),
+          }))
+        );
+        const missing = missingChecks.filter((r) => !r.hasSession).map((r) => r.acc);
+        const unreachable = missingChecks.filter((r) => r.hasSession).map((r) => r.acc);
         setMissingSessionAccounts(missing);
         if (missing.length > 0) {
           notify(
-            `Could not connect to Telegram for ${missing
+            `Telegram session missing for ${missing
               .map((a: any) => a.displayName || a.phoneMasked || a._id)
-              .join(', ')}. The local session may be missing or expired — please re-link the account.`,
+              .join(', ')}. Please re-link the account.`,
+            'error'
+          );
+        }
+        if (unreachable.length > 0) {
+          notify(
+            `Could not reach Telegram for ${unreachable
+              .map((a: any) => a.displayName || a.phoneMasked || a._id)
+              .join(', ')}. Check your network; RealtyDesk will retry automatically.`,
             'error'
           );
         }
@@ -1150,24 +1334,9 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           for (const { acc, dialogs } of liveResults) {
             if (isCancelled || dialogs.length === 0) continue;
             try {
-              // Auto-save unsaved contacts to the Telegram address book as well
-              // (agent opt-in), keeping the agent's phone number hidden.
-              try {
-                if (localStorage.getItem('rd_auto_save_contacts') === '1') {
-                  const cl = await getLiveClient(acc._id);
-                  if (cl) {
-                    const preset = localStorage.getItem('rd_contact_preset') || '';
-                    for (const d of dialogs) {
-                      if (isCancelled) break;
-                      if (d.contactId?.savedName) continue; // already saved in Telegram
-                      const firstName = d.contactId?.firstName || '';
-                      const lastName = [d.contactId?.lastName, preset].filter(Boolean).join(' ').trim();
-                      if (!firstName && !lastName) continue;
-                      await saveContactToTelegram(cl, d.entity, firstName, lastName, d.contactId?.phoneNumber);
-                    }
-                  }
-                }
-              } catch {}
+              // CRM sync only. Do NOT auto-add to Telegram address book during
+              // historical startup sync (ban/FLOOD_WAIT risk). Live incoming
+              // messages are queued separately with human-like delay + daily cap.
               const items = dialogs.map((d) => ({
                 chatExternalId: d.externalChatId,
                 contact: {
@@ -1176,17 +1345,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                   phoneNumber: d.contactId?.phoneNumber,
                   avatarUrl: d.contactId?.avatarUrl,
                   displayName: d.contactId?.displayName,
-                  savedName: (() => {
-                    try {
-                      const enabled = localStorage.getItem('rd_auto_save_contacts') === '1';
-                      const preset = localStorage.getItem('rd_contact_preset') || contactPreset || '';
-                      if (enabled && !d.contactId?.savedName) {
-                        const parts = [d.contactId?.firstName, d.contactId?.lastName, preset].filter(Boolean).map(String).map((s) => s.trim()).filter(Boolean);
-                        if (parts.length) return parts.join(' ');
-                      }
-                    } catch {}
-                    return d.contactId?.savedName;
-                  })(),
+                  savedName: d.contactId?.savedName,
                   firstName: d.contactId?.firstName,
                   lastName: d.contactId?.lastName,
                   isBlocked: d.isBlocked,
@@ -1253,62 +1412,108 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   };
 
   // Exact count of chats that appear in the "Repeated" tab/list.
-  const repeatedClientCount = chats.filter(isRepeatedChatInView).length;
+  const repeatedClientCount = useMemo(() => chats.filter(isRepeatedChatInView).length, [chats, repeatedChatIds, selectedAccountId]);
 
   // Filter & Search ΓÇö purely local; server always returns all chats (includeArchived=true)
-  const filteredChats = chats.filter((c) => {
-    // If an account is selected in the multi-account tab bar, only show chats for that account
-    if (selectedAccountId) {
-      const cAccId = String(c.telegramAccountId?._id || c.telegramAccountId || '');
-      if (cAccId && cAccId !== String(selectedAccountId)) {
-        return false;
+  const filteredChats = useMemo(() => {
+    const myAccIds = filter === 'mine' ? new Set(telegramAccounts.map((a: any) => String(a._id))) : null;
+    const q = debouncedQuery.trim().toLowerCase();
+    return chats.filter((c) => {
+      // If an account is selected in the multi-account tab bar, only show chats for that account
+      if (selectedAccountId) {
+        const cAccId = String(c.telegramAccountId?._id || c.telegramAccountId || '');
+        if (cAccId && cAccId !== String(selectedAccountId)) {
+          return false;
+        }
       }
-    }
 
-    // Archived visibility: only show archived in archived filter; hide everywhere else
-    if (filter === 'archived' && !c.isArchived) return false;
-    if (filter !== 'archived' && c.isArchived) return false;
+      // Archived visibility: only show archived in archived filter; hide everywhere else
+      if (filter === 'archived' && !c.isArchived) return false;
+      if (filter !== 'archived' && c.isArchived) return false;
 
-    if (filter === 'unread' && !(c.unreadCount > 0)) return false;
-    if (filter === 'blocked' && !(c.isBlocked || c.contactId?.isBlocked)) return false;
+      if (filter === 'unread' && !(c.unreadCount > 0)) return false;
+      if (filter === 'blocked' && !(c.isBlocked || c.contactId?.isBlocked)) return false;
 
-    // Repeated: check server-authoritative set (keyed by both _id and externalChatId)
-    if (filter === 'repeated') {
-      const isRep =
-        repeatedChatIds.has(String(c._id || '')) ||
-        repeatedChatIds.has(String(c.externalChatId || ''));
-      if (!isRep || c.isArchived) return false;
-    }
-
-    // Transferred: chats containing a t.me/ link
-    if (filter === 'transferred') {
-      if (!c.isTransferred && !containsTmeLink(c.lastMessagePreview)) return false;
-    }
-
-    // Mine: show only chats belonging to my telegram accounts
-    if (filter === 'mine') {
-      const myAccIds = new Set(telegramAccounts.map((a: any) => String(a._id)));
-      const chatAccId = String(c.telegramAccountId?._id || c.telegramAccountId || '');
-      if (!myAccIds.has(chatAccId)) return false;
-    }
-
-    if (debouncedQuery.trim()) {
-      const q = debouncedQuery.toLowerCase();
-      const name = getChatDisplayName(c).toLowerCase();
-      const prev = (c.lastMessagePreview || '').toLowerCase();
-      const user = (c.contactId?.username || '').toLowerCase();
-      const phone = (c.contactId?.phoneNumber || '');
-      if (!name.includes(q) && !prev.includes(q) && !user.includes(q) && !phone.includes(q)) {
-        return false;
+      // Repeated: check server-authoritative set (keyed by both _id and externalChatId)
+      if (filter === 'repeated') {
+        const isRep =
+          repeatedChatIds.has(String(c._id || '')) ||
+          repeatedChatIds.has(String(c.externalChatId || ''));
+        if (!isRep || c.isArchived) return false;
       }
-    }
-    return true;
-  });
 
-  const unreadCount = chats.filter((c) => c.unreadCount > 0 && !c.isArchived).length;
-  const transferredCount = chats.filter(
-    (c) => !c.isArchived && (c.isTransferred || containsTmeLink(c.lastMessagePreview))
-  ).length;
+      // Transferred: chats containing a t.me/ link
+      if (filter === 'transferred') {
+        if (!c.isTransferred && !containsTmeLink(c.lastMessagePreview)) return false;
+      }
+
+      // Mine: show only chats belonging to my telegram accounts
+      if (filter === 'mine' && myAccIds) {
+        const chatAccId = String(c.telegramAccountId?._id || c.telegramAccountId || '');
+        if (!myAccIds.has(chatAccId)) return false;
+      }
+
+      if (q) {
+        const name = getChatDisplayName(c).toLowerCase();
+        const prev = (c.lastMessagePreview || '').toLowerCase();
+        const user = (c.contactId?.username || '').toLowerCase();
+        const phone = (c.contactId?.phoneNumber || '');
+        const inMemory =
+          name.includes(q) || prev.includes(q) || user.includes(q) || phone.includes(q);
+        // Fall back to the SQLite FTS5 index so matches inside older cached
+        // message bodies still surface without loading every thread.
+        const inFts =
+          ftsChatIds.has(chatCacheKey(c)) ||
+          ftsChatIds.has(String(c._id || '')) ||
+          ftsChatIds.has(String(c.externalChatId || ''));
+        if (!inMemory && !inFts) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [chats, selectedAccountId, filter, repeatedChatIds, telegramAccounts, debouncedQuery, ftsChatIds]);
+
+  const unreadCount = useMemo(() => chats.filter((c) => c.unreadCount > 0 && !c.isArchived).length, [chats]);
+  const transferredCount = useMemo(
+    () => chats.filter((c) => !c.isArchived && (c.isTransferred || containsTmeLink(c.lastMessagePreview))).length,
+    [chats]
+  );
+
+  // Only mount chat rows near the viewport. 68px matches .chat-item's row height.
+  const {
+    start: virtualStart,
+    end: virtualEnd,
+    paddingTop: virtualPaddingTop,
+    paddingBottom: virtualPaddingBottom,
+  } = useVirtualRows(chatListRef, filteredChats.length, 68, 6);
+
+  // Persist a light local-first copy so the next launch paints instantly.
+  // localStorage gives the synchronous first paint; SQLite is the durable
+  // cache and the FTS5 search index. A cheap signature skips writes when the
+  // list merely re-rendered with the same content.
+  useEffect(() => {
+    const sig = chats
+      .map(
+        (c) =>
+          `${chatCacheKey(c)}|${c.lastMessageAt || ''}|${c.unreadCount || 0}|${
+            c.isArchived ? 1 : 0
+          }|${String(c.lastMessagePreview || '').slice(0, 40)}`
+      )
+      .join('\n');
+    if (sig === chatCacheSigRef.current) return;
+    const timer = setTimeout(() => {
+      chatCacheSigRef.current = sig;
+      writeCachedChats(chats);
+      cacheChatsToDb(chats).catch(() => {});
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [chats]);
+
+  // A new filter/query is a new list; start it at the top.
+  useEffect(() => {
+    if (chatListRef.current) chatListRef.current.scrollTop = 0;
+  }, [filter, debouncedQuery, selectedAccountId]);
 
   const handleSelectChat = useCallback((id: string) => {
     setSelectedChatId(id);
@@ -1430,42 +1635,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                 ))}
               </div>
             )}
-            {role === 'agent' && (
-              <div className="tg-drawer-section">
-                <div className="tg-drawer-section-title">
-                  <span>Auto-save contacts</span>
-                </div>
-                <label className="tg-drawer-status-row" style={{ cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={autoSaveContacts}
-                    onChange={(e) => {
-                      const v = e.target.checked;
-                      setAutoSaveContacts(v);
-                      try { localStorage.setItem('rd_auto_save_contacts', v ? '1' : '0'); } catch {}
-                    }}
-                  />
-                  <span className="tg-drawer-status-label">
-                    {autoSaveContacts ? 'Enabled' : 'Disabled'}
-                  </span>
-                </label>
-                <input
-                  className="tg-search-input"
-                  style={{ marginTop: 8, width: '100%' }}
-                  placeholder="Preset name (e.g. Lead)"
-                  value={contactPreset}
-                  disabled={!autoSaveContacts}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setContactPreset(v);
-                    try { localStorage.setItem('rd_contact_preset', v); } catch {}
-                  }}
-                />
-                <p style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                  When enabled, new contacts are saved as ΓÇ£First Last {contactPreset || 'Preset'}ΓÇ¥.
-                </p>
-              </div>
-            )}
+
 
             <div className="tg-drawer-section">
               <div className="tg-drawer-section-title">
@@ -1565,7 +1735,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             {missingSessionAccounts
               .map((a: any) => a.displayName || a.phoneMasked || a.telegramUserId)
               .join(', ')}
-            . The local session may be missing or expired. Please re-link the account.
+            . The local Telegram session is missing. Please re-link the account.
           </span>
           {onAddTelegram && (
             <button className="secondary-btn small-btn" onClick={onAddTelegram}>
@@ -1589,7 +1759,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             <button
               type="button"
               className="icon-btn"
-              onClick={() => { loadChats(true); fetchRepeatedIds(); }}
+              onClick={() => { loadChats(true); fetchRepeatedIds(true); }}
               title="Refresh conversations"
               aria-label="Refresh conversations"
             >
@@ -1741,7 +1911,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           </div>
         )}
 
-        <ul className="chat-items">
+        <ul className="chat-items" ref={chatListRef}>
           {loadingChats ? (
             <ChatSkeletons count={8} />
           ) : filteredChats.length === 0 ? (
@@ -1755,20 +1925,28 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               </p>
             </li>
           ) : (
-            filteredChats.map((chat) => {
-              const chatId = chat._id || chat.externalChatId;
-              return (
-                <ChatItem
-                  key={chatId}
-                  chat={chat}
-                  isSelected={chat._id === selectedChatId || chat.externalChatId === selectedChatId}
-                  isRepeated={repeatedChatIds.has(chatId)}
-                  collisionInfo={collisionMap.get(chatId)}
-                  scope={scope}
-                  onSelect={handleSelectChat}
-                />
-              );
-            })
+            <>
+              {virtualPaddingTop > 0 && (
+                <li aria-hidden="true" style={{ height: `${virtualPaddingTop}px` }} />
+              )}
+              {filteredChats.slice(virtualStart, virtualEnd).map((chat) => {
+                const chatId = chat._id || chat.externalChatId;
+                return (
+                  <ChatItem
+                    key={chatId}
+                    chat={chat}
+                    isSelected={chat._id === selectedChatId || chat.externalChatId === selectedChatId}
+                    isRepeated={repeatedChatIds.has(chatId)}
+                    collisionInfo={collisionMap.get(chatId)}
+                    scope={scope}
+                    onSelect={handleSelectChat}
+                  />
+                );
+              })}
+              {virtualPaddingBottom > 0 && (
+                <li aria-hidden="true" style={{ height: `${virtualPaddingBottom}px` }} />
+              )}
+            </>
           )}
         </ul>
       </aside>
@@ -1931,8 +2109,35 @@ function ChatThread({
 }) {
   const draftKey = String(chat.externalChatId || chat._id || '');
   const cacheKey = `${String(chat.telegramAccountId?._id || chat.telegramAccountId || '')}:${draftKey}`;
+  const sqliteKey = chatCacheKey(chat);
   const cachedThread = threadMessageCache.get(cacheKey);
   const [messages, setMessages] = useState<any[]>(() => cachedThread?.messages ?? []);
+  const { msgById, groupedItems } = useMemo(() => {
+    const byId = new Map<string, any>();
+    for (const m of messages) {
+      const mid = String(m.telegramMessageId || m._id || '');
+      if (mid) byId.set(mid, m);
+    }
+    const items: Array<{ kind: 'single'; msg: any } | { kind: 'album'; key: string; items: any[] }> = [];
+    for (const m of messages) {
+      const gid = m.groupedId ? String(m.groupedId) : '';
+      const prev = items[items.length - 1];
+      if (
+        gid &&
+        prev &&
+        prev.kind === 'album' &&
+        prev.items[0]?.groupedId === gid &&
+        prev.items[0]?.direction === m.direction
+      ) {
+        prev.items.push(m);
+      } else if (gid) {
+        items.push({ kind: 'album', key: `album-${gid}-${m._id || m.telegramMessageId}`, items: [m] });
+      } else {
+        items.push({ kind: 'single', msg: m });
+      }
+    }
+    return { msgById: byId, groupedItems: items };
+  }, [messages]);
   const [translations, setTranslations] = useState<Record<string, string>>({});
   const [loadingMessages, setLoadingMessages] = useState(() => !cachedThread?.messages?.length);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -1943,8 +2148,13 @@ function ChatThread({
   const [draft, setDraftState] = useState(() => draftStore.get(draftKey)?.text ?? '');
   const [sending, setSending] = useState(false);
   const [previewMedia, setPreviewMedia] = useState<string | null>(null);
-  const [attachment, setAttachmentState] = useState<DraftAttachment | null>(
-    () => draftStore.get(draftKey)?.attachment ?? null
+  const [attachments, setAttachmentsState] = useState<DraftAttachment[]>(
+    () => {
+      const entry = draftStore.get(draftKey) as any;
+      if (Array.isArray(entry?.attachments)) return entry.attachments;
+      if (entry?.attachment) return [entry.attachment];
+      return [];
+    }
   );
   const [sendTranslateEnabled, setSendTranslateEnabled] = useState<boolean>(() => {
     try { return localStorage.getItem('rd_send_translate') === '1'; } catch { return false; }
@@ -1955,18 +2165,75 @@ function ChatThread({
   const [translatedPreview, setTranslatedPreview] = useState<{ src: string; text: string } | null>(null);
   const [translatingPreview, setTranslatingPreview] = useState(false);
 
+  // Windowed rendering: only a bounded slice of the message list stays in the
+  // DOM. Older messages are revealed progressively as the user scrolls up,
+  // keeping long threads responsive without breaking load-older/reply-jump.
+  const MESSAGE_WINDOW = 120;
+  const MESSAGE_PAGE = 80;
+  const [renderStart, setRenderStart] = useState(0);
+
+  // Reset the window when the thread is replaced (new chat / fresh fetch).
+  useEffect(() => {
+    const len = groupedItems.length;
+    if (len === 0) {
+      setRenderStart(0);
+      return;
+    }
+    setRenderStart((prev) => (prev === 0 || prev > len ? Math.max(0, len - MESSAGE_WINDOW) : prev));
+  }, [groupedItems.length]);
+
+  // Prune the top of the window while the user is parked near the bottom.
+  useEffect(() => {
+    const len = groupedItems.length;
+    if (len - renderStart <= MESSAGE_WINDOW + MESSAGE_PAGE) return;
+    const area = messagesAreaRef.current;
+    const nearBottom = !area || area.scrollTop + area.clientHeight >= area.scrollHeight - 240;
+    if (!nearBottom) return;
+    setRenderStart(len - MESSAGE_WINDOW);
+    requestAnimationFrame(() => {
+      if (messagesAreaRef.current) messagesAreaRef.current.scrollTop = messagesAreaRef.current.scrollHeight;
+    });
+  }, [groupedItems.length, renderStart]);
+
+  // Cold-start hydration from SQLite: when the in-memory thread cache is empty
+  // (e.g. after a relaunch) show the last synced messages immediately.
+  useEffect(() => {
+    if (cachedThread?.messages?.length) return;
+    let cancelled = false;
+    loadCachedMessages(sqliteKey)
+      .then((rows) => {
+        if (cancelled || rows.length === 0) return;
+        setMessages((prev) => (prev.length > 0 ? prev : rows));
+        setLoadingMessages(false);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sqliteKey]);
+
+  // Debounced write-through so the thread survives relaunch/offline open.
+  useEffect(() => {
+    if (messages.length === 0) return;
+    const timer = setTimeout(() => {
+      cacheMessagesToDb(sqliteKey, messages, true).catch(() => {});
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [messages, sqliteKey]);
+
   // Write-through so an unsent draft survives switching to another conversation.
   const setDraft = (text: string) => {
     setDraftState(text);
-    const att = draftStore.get(draftKey)?.attachment ?? null;
-    if (!text && !att) draftStore.delete(draftKey);
-    else draftStore.set(draftKey, { text, attachment: att });
+    const atts = ((draftStore.get(draftKey) as any)?.attachments ?? []) as DraftAttachment[];
+    if (!text && atts.length === 0) draftStore.delete(draftKey);
+    else draftStore.set(draftKey, { text, attachments: atts });
   };
-  const setAttachment = (att: DraftAttachment | null) => {
-    setAttachmentState(att);
+  const setAttachments = (atts: DraftAttachment[]) => {
+    setAttachmentsState(atts);
     const text = draftStore.get(draftKey)?.text ?? '';
-    if (!text && !att) draftStore.delete(draftKey);
-    else draftStore.set(draftKey, { text, attachment: att });
+    if (!text && atts.length === 0) draftStore.delete(draftKey);
+    else draftStore.set(draftKey, { text, attachments: atts });
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1981,7 +2248,14 @@ function ChatThread({
   const [chatClient, setChatClient] = useState<TelegramClient | null>(null);
   const [resolvingClient, setResolvingClient] = useState<boolean>(() => Boolean(chatAccountId));
 
-  // Auto-translate both incoming and outgoing messages into the agent's target language.
+  const translationsRef = useRef(translations);
+  useEffect(() => {
+    translationsRef.current = translations;
+  }, [translations]);
+
+  // Auto-translate recent messages into the agent's target language.
+  // Only the newest window is translated, in batches, so a 500-message thread
+  // never floods the network/UI on open.
   useEffect(() => {
     try { if (localStorage.getItem('rd_auto_translate') === '0') return; } catch {}
     const target = getTargetLanguage();
@@ -1990,22 +2264,33 @@ function ChatThread({
       .filter((m) => {
         if (!m.text || m.text.startsWith('[')) return false;
         const id = String(m._id || m.telegramMessageId || '');
-        return id && translations[id] === undefined;
-      });
+        return id && translationsRef.current[id] === undefined;
+      })
+      .slice(0, 40);
     if (pending.length === 0) return;
     let cancelled = false;
     (async () => {
+      const updates: Record<string, string> = {};
+      let count = 0;
       for (const m of pending) {
         if (cancelled) return;
         const id = String(m._id || m.telegramMessageId || '');
         const tr = await translateText(m.text, target);
         if (cancelled) return;
-        setTranslations((prev) => ({ ...prev, [id]: tr && tr !== m.text ? tr : '' }));
-        await new Promise((r) => setTimeout(r, 80));
+        updates[id] = tr && tr !== m.text ? tr : '';
+        count += 1;
+        if (count % 4 === 0) {
+          const batch = { ...updates };
+          setTranslations((prev) => ({ ...prev, ...batch }));
+        }
+      }
+      if (!cancelled) {
+        const batch = { ...updates };
+        setTranslations((prev) => ({ ...prev, ...batch }));
       }
     })();
     return () => { cancelled = true; };
-  }, [messages, translations]);
+  }, [messages]);
 
   // Outgoing messages belong to the viewer only when this chat's account is one
   // of their own linked accounts. Otherwise they were sent by the account owner.
@@ -2057,6 +2342,15 @@ function ChatThread({
   // (its contact or chat id appears in 2+ distinct Telegram accounts).
   const isRepeatedLead = Boolean(!chat.isArchived && serverRepeatedIds.has(String(chat._id || chat.externalChatId || '')));
 
+  // Mark this conversation as read on Telegram too, so the phone/other clients
+  // reflect the read state (CRM -> Telegram sync).
+  useEffect(() => {
+    if (!chatClient || messages.length === 0) return;
+    const entity = chat.inputEntity || chat.entity;
+    if (!entity) return;
+    chatClient.markAsRead(entity).catch(() => {});
+  }, [chatClient, messages.length, chat.inputEntity, chat.entity]);
+
   const fetchMessages = async (isInitial = false) => {
     try {
       const hasCached = Boolean(threadMessageCache.get(cacheKey)?.messages?.length);
@@ -2085,6 +2379,15 @@ function ChatThread({
             setMessages((prev) =>
               prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: dataUrl } : m))
             );
+            const mediaKey = `msg_${sqliteKey}_${msgId}`;
+            storeMediaDataUrl(mediaKey, dataUrl)
+              .then((url) => {
+                if (!url) return;
+                setMessages((prev) =>
+                  prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: url } : m))
+                );
+              })
+              .catch(() => {});
           }
         );
         msgs = res.messages.map((m: any) =>
@@ -2162,6 +2465,15 @@ function ChatThread({
             setMessages((prev) =>
               prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: dataUrl } : m))
             );
+            const mediaKey = `msg_${sqliteKey}_${msgId}`;
+            storeMediaDataUrl(mediaKey, dataUrl)
+              .then((url) => {
+                if (!url) return;
+                setMessages((prev) =>
+                  prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: url } : m))
+                );
+              })
+              .catch(() => {});
           }
         );
 
@@ -2239,6 +2551,15 @@ function ChatThread({
             setMessages((prev) =>
               prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: dataUrl } : m))
             );
+            const mediaKey = `msg_${sqliteKey}_${msgId}`;
+            storeMediaDataUrl(mediaKey, dataUrl)
+              .then((url) => {
+                if (!url) return;
+                setMessages((prev) =>
+                  prev.map((m) => (m.telegramMessageId === msgId ? { ...m, mediaRef: url } : m))
+                );
+              })
+              .catch(() => {});
           }
         );
 
@@ -2295,10 +2616,14 @@ function ChatThread({
           setMessages((prev) => {
             // The optimistic copy appended after sending arrives here too.
             if (prev.some((m) => String(m.telegramMessageId) === msgId)) return prev;
+            const area = messagesAreaRef.current;
+            const nearBottom = !area || area.scrollTop + area.clientHeight >= area.scrollHeight - 160;
+            if (nearBottom) shouldScrollToBottomRef.current = true;
             return [...prev, liveMsg];
           });
           // Mirror to the server so the owner's poll-based view sees it too.
           mirrorLiveChatToCRM(chatAccountId, chat, [liveMsg]).catch(() => {});
+
 
           // Fetch attached photos in the background so they appear instantly.
           if (msg.media && chatClient) {
@@ -2370,15 +2695,23 @@ function ChatThread({
   }, [messages.length, loadingMessages]);
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setAttachment({ file, dataUrl: reader.result });
-      }
-    };
-    reader.readAsDataURL(file);
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    files.forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          setAttachmentsState((prev) => {
+            const next = [...prev, { file, dataUrl: reader.result as string }];
+            const text = draftStore.get(draftKey)?.text ?? '';
+            if (!text && next.length === 0) draftStore.delete(draftKey);
+            else draftStore.set(draftKey, { text, attachments: next });
+            return next;
+          });
+        }
+      };
+      reader.readAsDataURL(file);
+    });
     e.target.value = '';
   }
 
@@ -2408,9 +2741,10 @@ function ChatThread({
   }, [draft, sendTranslateEnabled, sendTranslateLang]);
 
   async function handleSend() {
-    if ((!draft.trim() && !attachment) || sending) return;
+    if ((!draft.trim() && attachments.length === 0) || sending) return;
     const rawText = draft.trim();
-    const mediaToSend = attachment?.dataUrl;
+    const filesToSend = attachments.map((a) => a.file);
+    const previewUrl = attachments[0]?.dataUrl;
     setSending(true);
 
     try {
@@ -2424,27 +2758,30 @@ function ChatThread({
       }
       const peer = chat.entity || chat.inputEntity || chat.externalChatId;
 
-      if (chatClient && chatClient.connected && peer && textToSend) {
-        // Send directly through Telegram MTProto in real time, from the account
-        // that actually owns this conversation.
-        const sent = await sendLiveTelegramMessage(chatClient, peer, textToSend);
+      if (chatClient && chatClient.connected && peer && (textToSend || filesToSend.length > 0)) {
+        const sent = await sendLiveTelegramMessage(chatClient, peer, {
+          text: filesToSend.length > 0 ? undefined : textToSend,
+          caption: filesToSend.length > 0 ? textToSend : undefined,
+          files: filesToSend.length > 0 ? filesToSend : undefined,
+        });
         if (!chat.isArchived && containsTmeLink(textToSend)) {
           onChatTransferred();
         }
-        const outgoing: LiveMessage = {
-          ...sent,
+        const outgoing: LiveMessage[] = sent.map((s, idx) => ({
+          ...s,
           senderType: outgoingSenderType,
-        };
+          text: s.text || (idx === 0 ? textToSend : ''),
+          mediaRef: filesToSend.length > 0 ? (idx === 0 ? previewUrl : '[Photo]') : s.mediaRef,
+        }));
         setMessages((prev) => {
-          if (prev.some((m) => String(m.telegramMessageId) === String(outgoing.telegramMessageId))) {
-            return prev;
-          }
-          return [...prev, outgoing];
+          const existing = new Set(prev.map((m) => String(m.telegramMessageId)));
+          const fresh = outgoing.filter((m) => !existing.has(String(m.telegramMessageId)));
+          return fresh.length ? [...prev, ...fresh] : prev;
         });
-        mirrorLiveChatToCRM(chatAccountId, chat, [outgoing]).catch(() => { });
+        mirrorLiveChatToCRM(chatAccountId, chat, outgoing).catch(() => { });
       } else if (role === 'owner') {
         const msgId = String(Date.now());
-        await api.recordOwnerReply(chat._id, textToSend || (mediaToSend ? '[Photo]' : ''), msgId, mediaToSend);
+        await api.recordOwnerReply(chat._id, textToSend || (filesToSend.length ? '[Photo]' : ''), msgId, previewUrl);
         await fetchMessages();
       } else {
         const msgId = String(Date.now());
@@ -2462,7 +2799,7 @@ function ChatThread({
               direction: 'out',
               senderType: 'agent',
               text: textToSend,
-              mediaRef: mediaToSend,
+              mediaRef: previewUrl,
               sentAt: new Date().toISOString(),
             },
           ],
@@ -2471,7 +2808,7 @@ function ChatThread({
       }
 
       setDraft('');
-      setAttachment(null);
+      setAttachments([]);
       onMessageSent();
     } catch (err: any) {
       const errMsg = err?.message || String(err);
@@ -2618,7 +2955,7 @@ function ChatThread({
             <button className="media-preview-close" onClick={() => setPreviewMedia(null)} aria-label="Close media preview">
               <CloseIcon size={20} />
             </button>
-            <img src={previewMedia} alt="Preview" className="media-preview-img-full" />
+            <img src={previewMedia} alt="Preview" decoding="async" className="media-preview-img-full" />
           </div>
         </div>
       )}
@@ -2632,6 +2969,9 @@ function ChatThread({
           if (!initialScrollDoneRef.current) return;
           if (e.currentTarget.scrollTop <= 150) {
             loadOlderMessagesRef.current();
+          }
+          if (e.currentTarget.scrollTop <= 400 && renderStart > 0) {
+            setRenderStart((s) => Math.max(0, s - MESSAGE_PAGE));
           }
         }}
       >
@@ -2670,39 +3010,17 @@ function ChatThread({
           </div>
         )}
 
+        {renderStart > 0 && (
+          <div
+            aria-hidden="true"
+            style={{ height: `${renderStart * 72}px`, flexShrink: 0 }}
+          />
+        )}
         {loadingMessages ? (
           <MessageSkeletons />
         ) : messages.length === 0 ? (
           <div className="no-messages-placeholder">No messages in this chat yet. Start the conversation below.</div>
         ) : (() => {
-          const msgById = new Map<string, any>();
-          for (const m of messages) {
-            const mid = String(m.telegramMessageId || m._id || '');
-            if (mid) msgById.set(mid, m);
-          }
-
-          // Group consecutive messages sharing the same Telegram groupedId (photo albums)
-          const groupedItems: Array<
-            | { kind: 'single'; msg: any }
-            | { kind: 'album'; key: string; items: any[] }
-          > = [];
-          for (const m of messages) {
-            const gid = m.groupedId ? String(m.groupedId) : '';
-            const prev = groupedItems[groupedItems.length - 1];
-            if (
-              gid &&
-              prev &&
-              prev.kind === 'album' &&
-              prev.items[0]?.groupedId === gid &&
-              prev.items[0]?.direction === m.direction
-            ) {
-              prev.items.push(m);
-            } else if (gid) {
-              groupedItems.push({ kind: 'album', key: `album-${gid}-${m._id || m.telegramMessageId}`, items: [m] });
-            } else {
-              groupedItems.push({ kind: 'single', msg: m });
-            }
-          }
 
           const isMediaPlaceholderText = (t?: string) =>
             !t || t === '[Media]' || t === '[Photo]' || t.startsWith('[Photo');
@@ -2730,14 +3048,27 @@ function ChatThread({
                 role="button"
                 tabIndex={0}
                 onClick={() => {
-                  const el = messagesAreaRef.current?.querySelector(
-                    `[data-msg-id="${msg.replyToMsgId}"]`
-                  ) as HTMLElement | null;
-                  if (el) {
-                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    el.classList.add('is-reply-highlight');
-                    setTimeout(() => el.classList.remove('is-reply-highlight'), 1400);
+                  const targetId = String(msg.replyToMsgId);
+                  const targetIndex = groupedItems.findIndex((e) => {
+                    const first = e.kind === 'album' ? e.items[0] : e.msg;
+                    return String(first.telegramMessageId || first._id || '') === targetId;
+                  });
+                  if (targetIndex >= 0 && targetIndex < renderStart) {
+                    setRenderStart(Math.max(0, targetIndex - 5));
                   }
+                  const attempt = () => {
+                    const el = messagesAreaRef.current?.querySelector(
+                      `[data-msg-id="${msg.replyToMsgId}"]`
+                    ) as HTMLElement | null;
+                    if (el) {
+                      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      el.classList.add('is-reply-highlight');
+                      setTimeout(() => el.classList.remove('is-reply-highlight'), 1400);
+                    } else {
+                      requestAnimationFrame(attempt);
+                    }
+                  };
+                  requestAnimationFrame(() => requestAnimationFrame(attempt));
                 }}
               >
                 <span className="bubble-reply-sender">{senderLabel}</span>
@@ -2768,7 +3099,7 @@ function ChatThread({
             return <p className="bubble-text bubble-translation">{tr}</p>;
           };
 
-          return groupedItems.map((entry) => {
+          return groupedItems.slice(renderStart).map((entry) => {
             if (entry.kind === 'album') {
               const first = entry.items[0];
               const last = entry.items[entry.items.length - 1];
@@ -2794,6 +3125,7 @@ function ChatThread({
                             alt={`Photo ${idx + 1}`}
                             className="bubble-media-grid-img"
                             loading="lazy"
+                            decoding="async"
                             onError={(e) => {
                               (e.target as HTMLElement).style.display = 'none';
                             }}
@@ -2840,6 +3172,7 @@ function ChatThread({
                       alt="Photo"
                       className="bubble-media-img"
                       loading="lazy"
+                      decoding="async"
                       onError={(e) => {
                         (e.target as HTMLElement).style.display = 'none';
                       }}
@@ -2873,21 +3206,27 @@ function ChatThread({
       </div>
 
       <div className="composer-wrapper">
-        {attachment && (
-          <div className="composer-attachment-preview">
-            <img src={attachment.dataUrl} className="composer-attachment-thumb" alt="Attachment" />
+        {attachments.length > 0 && (
+          <div className="composer-attachment-preview" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {attachments.map((att, idx) => (
+              <div key={`${att.file.name}-${idx}`} style={{ position: 'relative' }}>
+                <img src={att.dataUrl} decoding="async" className="composer-attachment-thumb" alt={att.file.name} />
+                <button
+                  type="button"
+                  className="composer-attachment-remove"
+                  onClick={() => setAttachments(attachments.filter((_, i) => i !== idx))}
+                  title="Remove attachment"
+                  style={{ position: 'absolute', top: -6, right: -6 }}
+                >
+                  <CloseIcon size={12} />
+                </button>
+              </div>
+            ))}
             <div className="composer-attachment-info">
-              <span className="composer-attachment-name">{attachment.file.name}</span>
-              <span style={{ fontSize: '11px', color: '#64748b' }}>Ready to send photo</span>
+              <span style={{ fontSize: '11px', color: '#64748b' }}>
+                {attachments.length} photo{attachments.length > 1 ? 's' : ''} ready to send{attachments.length > 1 ? ' (album)' : ''}
+              </span>
             </div>
-            <button
-              type="button"
-              className="composer-attachment-remove"
-              onClick={() => setAttachment(null)}
-              title="Remove attachment"
-            >
-              <CloseIcon size={15} />
-            </button>
           </div>
         )}
 
@@ -2991,6 +3330,7 @@ function ChatThread({
             type="file"
             ref={fileInputRef}
             accept="image/*"
+            multiple
             style={{ display: 'none' }}
             onChange={handleFileSelect}
           />
@@ -3024,7 +3364,7 @@ function ChatThread({
             type="button"
             className="primary-btn send-btn"
             onClick={handleSend}
-            disabled={sending || (!draft.trim() && !attachment)}
+            disabled={sending || (!draft.trim() && attachments.length === 0)}
           >
             {sending ? (
               <span className="inline-btn-spinner" />

@@ -1,5 +1,6 @@
 import { TelegramClient, Api } from 'telegram';
 import { NewMessage } from 'telegram/events';
+import { Raw } from 'telegram/events';
 import { getActiveTelegramClient, reconnect } from './telegram';
 import { downloadAndCacheAvatar, getCachedAvatar, bufferToDataUrl } from './avatarCache';
 import { api } from '../api/client';
@@ -64,6 +65,18 @@ const withTimeout = <T>(promise: Promise<T>, ms = 4000): Promise<T | null> =>
     promise,
     new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
   ]);
+
+async function runWithConcurrency<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
+  const queue = [...items];
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, queue.length)) }, async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      if (item === undefined) return;
+      await fn(item);
+    }
+  });
+  await Promise.allSettled(workers);
+}
 
 /** Returns true when text contains a Telegram link (e.g. t.me/... or https://t.me/...). */
 export function containsTmeLink(text?: string | null): boolean {
@@ -134,9 +147,11 @@ export async function fetchLiveTelegramChats(
     } catch {}
 
     // 2. Fetch dialogs directly from Telegram MTProto (both main folder and archived folder 1)
+    // Limit startup sync to recent active chats; rely on NewMessage events for the rest.
+    const archivedLimit = Math.min(limit, 30);
     const [mainDialogs, archivedDialogs] = await Promise.all([
-      client.getDialogs({ limit }),
-      client.getDialogs({ folder: 1, limit: 100 }).catch(() => []),
+      withTimeout(client.getDialogs({ limit }), 15000).then((r) => r || []).catch(() => []),
+      withTimeout(client.getDialogs({ folder: 1, limit: archivedLimit }), 10000).then((r) => r || []).catch(() => []),
     ]);
 
     // Explicitly tag any dialog that comes from the archived folder
@@ -180,18 +195,7 @@ export async function fetchLiveTelegramChats(
         const fullName = [entity?.firstName, entity?.lastName].filter(Boolean).join(' ').trim();
         const dialogTitle = (dialog.title || dialog.name || '').trim();
         const isContactSaved = Boolean(entity?.contact);
-        let savedName = isContactSaved ? (dialogTitle || fullName || undefined) : undefined;
-        // Auto-save preset (agent opt-in): only applies to contacts that are NOT
-        // already saved in the Telegram address book, and only to "new" contacts.
-        if (!savedName) {
-          try {
-            if (localStorage.getItem('rd_auto_save_contacts') === '1') {
-              const preset = localStorage.getItem('rd_contact_preset') || '';
-              const parts = [entity?.firstName, entity?.lastName, preset].filter(Boolean).map(String).map((s) => s.trim()).filter(Boolean);
-              if (parts.length) savedName = parts.join(' ');
-            }
-          } catch {}
-        }
+        const savedName = isContactSaved ? (dialogTitle || fullName || undefined) : undefined;
         const displayName = savedName || fullName || dialogTitle || (entity?.username ? `@${entity.username.replace(/^@/, '')}` : 'Telegram Contact');
         const username = entity?.username ? entity.username.replace(/^@/, '') : undefined;
         const isBlocked = blockedUserIds.has(String(entity?.id || '')) || blockedUserIds.has(externalChatId);
@@ -298,10 +302,10 @@ export async function fetchLiveTelegramMessages(
       : peer;
 
   try {
-    const rawMessages: any = await client.getMessages(resolvedPeer, {
-      limit,
-      offsetId,
-    });
+    const rawMessages: any = await withTimeout(
+      client.getMessages(resolvedPeer, { limit, offsetId }),
+      15000
+    );
     if (!rawMessages || !Array.isArray(rawMessages)) {
       return { messages: [], hasMore: false };
     }
@@ -310,6 +314,7 @@ export async function fetchLiveTelegramMessages(
     const hasMore = rawMessages.length >= limit;
 
     const messages: LiveMessage[] = [];
+    const mediaToDownload: Array<{ m: any; msgId: string }> = [];
     let minId: number | undefined = undefined;
 
     for (const m of rawMessages) {
@@ -338,21 +343,26 @@ export async function fetchLiveTelegramMessages(
         groupedId: m.groupedId ? String(m.groupedId) : undefined,
       };
 
-      // Download photo media asynchronously
       if (m.media) {
-        withTimeout(client.downloadMedia(m, {}), 3500)
-          .then((buf) => {
-            if (buf && (buf as any).length > 0) {
-              const dataUrl = bufferToDataUrl(buf);
-              if (dataUrl && onMediaDownloaded) {
-                onMediaDownloaded(msgId, dataUrl);
-              }
-            }
-          })
-          .catch(() => {});
+        mediaToDownload.push({ m, msgId });
       }
 
       messages.push(liveMsg);
+    }
+
+    // Download media in background with limited concurrency for low-network performance.
+    if (mediaToDownload.length > 0) {
+      void runWithConcurrency(mediaToDownload, 3, async ({ m, msgId }) => {
+        try {
+          const buf = await withTimeout(client.downloadMedia(m, {}), 3500);
+          if (buf && (buf as any).length > 0) {
+            const dataUrl = bufferToDataUrl(buf);
+            if (dataUrl && onMediaDownloaded) {
+              onMediaDownloaded(msgId, dataUrl);
+            }
+          }
+        } catch {}
+      });
     }
 
     // Telegram getMessages returns newest first; reverse so oldest is at top
@@ -373,23 +383,57 @@ export async function fetchLiveTelegramMessages(
 /**
  * Sends a message directly to Telegram MTProto in real time.
  */
+export interface SendLiveMessageOptions {
+  text?: string;
+  files?: File[];
+  caption?: string;
+}
+
 export async function sendLiveTelegramMessage(
   client: TelegramClient,
   peer: any,
-  text: string
-): Promise<LiveMessage> {
-  const result = await client.sendMessage(peer, { message: text });
-  const msgId = String(result?.id || Date.now());
-  const sentAt = new Date().toISOString();
+  textOrOptions: string | SendLiveMessageOptions
+): Promise<LiveMessage[]> {
+  const opts: SendLiveMessageOptions =
+    typeof textOrOptions === 'string' ? { text: textOrOptions } : (textOrOptions || {});
+  const text = (opts.text ?? opts.caption ?? '').trim();
+  const files = (opts.files || []).filter(Boolean);
 
-  return {
-    _id: msgId,
-    telegramMessageId: msgId,
-    direction: 'out',
-    senderType: 'agent',
-    text,
-    sentAt,
-  };
+  let result: any;
+  if (files.length > 0) {
+    const inputFiles = files.map((f, i) => {
+      // File objects already carry a (read-only) `name`. Only synthesize one
+      // for nameless Blobs, without mutating the original (which throws on
+      // File instances where `name` is a getter-only property).
+      if (f instanceof File && f.name) return f;
+      try {
+        return new File([f], `photo-${i + 1}.jpg`, { type: (f as any)?.type || 'image/jpeg' });
+      } catch {
+        return f;
+      }
+    });
+    result = await client.sendFile(peer, {
+      file: inputFiles.length === 1 ? inputFiles[0] : inputFiles,
+      caption: text || undefined,
+      forceDocument: false,
+    } as any);
+  } else {
+    result = await client.sendMessage(peer, { message: text });
+  }
+
+  const results = Array.isArray(result) ? result : [result];
+  const sentAt = new Date().toISOString();
+  return results.map((r: any, idx: number) => {
+    const msgId = String(r?.id || `${Date.now()}-${idx}`);
+    return {
+      _id: msgId,
+      telegramMessageId: msgId,
+      direction: 'out' as const,
+      senderType: 'agent' as const,
+      text: idx === 0 ? text : '',
+      sentAt: r?.date ? new Date(r.date * 1000).toISOString() : sentAt,
+    };
+  });
 }
 
 /**
@@ -450,6 +494,8 @@ export interface LiveSubscriptionOptions {
   onReconnect?: () => void;
   /** How often to verify the socket is still alive. */
   watchdogMs?: number;
+  /** Fired when Telegram reports that messages were read (inbox or outbox). */
+  onReadHistory?: (peerIds: string[], stillUnreadCount: number | undefined) => void;
 }
 
 /**
@@ -469,6 +515,7 @@ export function subscribeLiveTelegramUpdates(
   let stopped = false;
   let reconnecting = false;
   let handlerAttached = false;
+  let rawHandlerAttached = false;
   let wasLive = Boolean(client?.connected);
 
   const handler = (event: any) => {
@@ -482,28 +529,57 @@ export function subscribeLiveTelegramUpdates(
     }
   };
 
-  const attach = () => {
-    if (!activeClient || handlerAttached) return;
+  const rawHandler = (update: any) => {
     try {
-      activeClient.addEventHandler(handler, new NewMessage({}));
-      handlerAttached = true;
+      const cls = update?.className || update?.constructor?.name || '';
+      if (cls !== 'UpdateReadHistoryInbox' && cls !== 'UpdateReadHistoryOutbox') return;
+      const peerIds = getMessagePeerIds({ peerId: update?.peer });
+      if (peerIds.length === 0) return;
+      const stillUnread = (typeof update?.stillUnreadCount === 'number')
+        ? update.stillUnreadCount
+        : undefined;
+      options.onReadHistory?.(peerIds, stillUnread);
     } catch (err) {
-      console.warn('[telegramLiveService] Could not attach update handler:', err);
+      console.warn('[telegramLiveService] Error in read-history handler:', err);
+    }
+  };
+
+  const attach = () => {
+    if (!activeClient) return;
+    if (!handlerAttached) {
+      try {
+        activeClient.addEventHandler(handler, new NewMessage({}));
+        handlerAttached = true;
+      } catch (err) {
+        console.warn('[telegramLiveService] Could not attach update handler:', err);
+      }
+    }
+    if (!rawHandlerAttached) {
+      try {
+        activeClient.addEventHandler(rawHandler, new Raw({ types: [Api.UpdateReadHistoryInbox, Api.UpdateReadHistoryOutbox] }));
+        rawHandlerAttached = true;
+      } catch (err) {
+        console.warn('[telegramLiveService] Could not attach read-history handler:', err);
+      }
     }
   };
 
   const detach = () => {
-    if (!activeClient || !handlerAttached) return;
-    try {
-      activeClient.removeEventHandler(handler, new NewMessage({}));
-    } catch {}
-    handlerAttached = false;
+    if (!activeClient) return;
+    if (handlerAttached) {
+      try { activeClient.removeEventHandler(handler, new NewMessage({})); } catch {}
+      handlerAttached = false;
+    }
+    if (rawHandlerAttached) {
+      try { activeClient.removeEventHandler(rawHandler, new Raw({ types: [Api.UpdateReadHistoryInbox, Api.UpdateReadHistoryOutbox] })); } catch {}
+      rawHandlerAttached = false;
+    }
   };
 
   const ensureLive = async () => {
     if (stopped || reconnecting) return;
     if (activeClient?.connected) {
-      if (!handlerAttached) attach();
+      if (!handlerAttached || !rawHandlerAttached) attach();
       if (!wasLive) {
         wasLive = true;
         options.onStatus?.('live');
@@ -575,62 +651,6 @@ export function subscribeLiveTelegramUpdates(
  * client messaging for the first time). Fetching the entity lets the inbox
  * show the conversation instantly instead of waiting for a full dialog reload.
  */
-const TELEGRAM_SAVED_CONTACTS_KEY = 'rd_telegram_saved_contacts';
-
-function getTelegramSavedContactSet(): Set<string> {
-  try {
-    const raw = localStorage.getItem(TELEGRAM_SAVED_CONTACTS_KEY);
-    if (raw) return new Set(JSON.parse(raw));
-  } catch {}
-  return new Set();
-}
-
-function markTelegramContactSaved(tgUserId: string): void {
-  try {
-    const set = getTelegramSavedContactSet();
-    set.add(tgUserId);
-    localStorage.setItem(TELEGRAM_SAVED_CONTACTS_KEY, JSON.stringify([...set]));
-  } catch {}
-}
-
-export async function saveContactToTelegram(
-  client: TelegramClient,
-  entity: any,
-  firstName: string,
-  lastName: string,
-  phone?: string
-): Promise<boolean> {
-  if (!client || !client.connected || !entity) return false;
-  if (entity?.self) return true;
-  if (entity?.contact) return true;
-  const tgId = entity?.id ? String(entity.id) : '';
-  if (tgId && getTelegramSavedContactSet().has(tgId)) return true;
-
-  try {
-    let inputUser: any;
-    if (entity?.id && entity?.accessHash) {
-      inputUser = new Api.InputUser({ userId: entity.id, accessHash: entity.accessHash });
-    } else {
-      inputUser = await client.getInputEntity(entity);
-    }
-    const resolvedPhone = (phone || entity?.phone || '').toString().replace(/^\+/, '');
-    await client.invoke(
-      new Api.contacts.AddContact({
-        id: inputUser,
-        firstName: (firstName || '').trim() || 'Contact',
-        lastName: (lastName || '').trim(),
-        phone: resolvedPhone,
-        addPhonePrivacyException: false,
-      })
-    );
-    if (tgId) markTelegramContactSaved(tgId);
-    return true;
-  } catch (err: any) {
-    console.warn('[telegramLiveService] AddContact failed:', err?.errorMessage || err?.message || err);
-    return false;
-  }
-}
-
 export async function buildLiveChatFromPeer(
   client: TelegramClient,
   telegramAccountId: string,
@@ -646,17 +666,7 @@ export async function buildLiveChatFromPeer(
     const dialogTitle = (entity.title || '').trim();
     const username = entity.username ? String(entity.username).replace(/^@/, '') : undefined;
     const isContactSaved = Boolean(entity?.contact);
-    let savedName: string | undefined;
-    if (isContactSaved) savedName = dialogTitle || fullName || undefined;
-    else {
-      try {
-        if (localStorage.getItem('rd_auto_save_contacts') === '1') {
-          const preset = localStorage.getItem('rd_contact_preset') || '';
-          const parts = [entity.firstName, entity.lastName, preset].filter(Boolean).map(String).map((s) => s.trim()).filter(Boolean);
-          if (parts.length) savedName = parts.join(' ');
-        }
-      } catch {}
-    }
+    const savedName = isContactSaved ? (dialogTitle || fullName || undefined) : undefined;
     const displayName = savedName || fullName || dialogTitle || (username ? `@${username}` : 'Telegram Contact');
 
     let avatarUrl = getCachedAvatar(externalChatId) || undefined;
@@ -711,21 +721,8 @@ export async function mirrorLiveChatToCRM(
   messages: LiveMessage[] = []
 ): Promise<void> {
   try {
-    // Auto-save to Telegram address book as well (agent opt-in), hiding the
-    // agent's phone number from the contact.
-    try {
-      if (localStorage.getItem('rd_auto_save_contacts') === '1' && !chat.contactId?.savedName && chat.entity) {
-        const preset = localStorage.getItem('rd_contact_preset') || '';
-        const firstName = chat.contactId?.firstName || '';
-        const lastName = [chat.contactId?.lastName, preset].filter(Boolean).join(' ').trim();
-        if (firstName || lastName) {
-          const cl = await getLiveClient(telegramAccountId);
-          if (cl) {
-            await saveContactToTelegram(cl, chat.entity, firstName, lastName, chat.contactId?.phoneNumber);
-          }
-        }
-      }
-    } catch {}
+    // CRM save only - instant and no Telegram API cost.
+    // Telegram address-book saving is handled separately by the live-message queue.
     await api.syncMessages({
       telegramAccountId,
       chatExternalId: chat.externalChatId,
@@ -734,16 +731,7 @@ export async function mirrorLiveChatToCRM(
         username: chat.contactId?.username,
         phoneNumber: chat.contactId?.phoneNumber,
         displayName: chat.contactId?.displayName,
-        savedName: (() => {
-         try {
-           if (localStorage.getItem('rd_auto_save_contacts') === '1' && !chat.contactId?.savedName) {
-             const preset = localStorage.getItem('rd_contact_preset') || '';
-             const parts = [chat.contactId?.firstName, chat.contactId?.lastName, preset].filter(Boolean);
-             if (parts.length) return parts.join(' ').trim();
-           }
-         } catch {}
-         return chat.contactId?.savedName;
-       })(),
+        savedName: chat.contactId?.savedName,
         firstName: chat.contactId?.firstName,
         lastName: chat.contactId?.lastName,
         avatarUrl: chat.contactId?.avatarUrl,

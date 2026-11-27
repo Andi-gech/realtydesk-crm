@@ -1,0 +1,209 @@
+REALTYDESK CRM - DEEP REVIEW (SECURITY, TELEGRAM COMPLIANCE, PERFORMANCE, PRODUCTION READINESS)
+Date: 2026-11-27
+Scope: Static code review of repository (client/, server/, tauri config, env/config files). This is not a penetration test or legal advice.
+
+EXECUTIVE SUMMARY
+- The app has a clear security boundary intent (Telegram MTProto sessions kept local; server stores metadata/messages). Several important controls exist (JWT secret validation, bcrypt, auth middleware, sync account ownership checks, DB indexes for main chat/message keys).
+- Before production, address Telegram policy/risk issues (userbot automation, bulk AddContact, rate limits), security hardening (CORS default, missing global/routed rate limits, stateless refresh tokens, error leakage, CSP null), and performance/scalability issues (large sync payloads, polling, N+1/large queries, localStorage growth, unbounded translation requests).
+- Severity legend: [CRITICAL] likely security/legal/data-loss risk; [HIGH] should fix before production; [MEDIUM] important; [LOW] improvement/hygiene.
+
+1. TELEGRAM RULES / COMPLIANCE / ACCOUNT-RISK
+[HIGH] User API (MTProto/GramJS) automation risk.
+- Evidence: client uses `telegram` (GramJS) with API_ID/API_HASH and user sessions (`client/src/lib/telegram.ts`, `client/src/lib/telegramLiveService.ts`, `client/package.json`).
+- Risk: Telegram Terms/API rules restrict spam, abuse, bulk actions, and unauthorized automation. User-account automation can trigger FLOOD_WAIT, limitations, or account bans even if intent is legitimate CRM use. This is a business risk, not just technical.
+- Suggestion: Obtain legal/product review for target jurisdictions/use case. Document acceptable use; avoid bulk/unsolicited messaging; add operator warnings; consider official Bot API where possible for bot flows (not a drop-in replacement for user inboxes). Implement conservative rate limiting and backoff for all Telegram write actions.
+
+[HIGH] Auto-save to Telegram address book uses contacts.AddContact automatically/bulk-capable.
+- Evidence: `saveContactToTelegram` calls `Api.contacts.AddContact` with `addPhonePrivacyException:false` (`client/src/lib/telegramLiveService.ts`). Bulk startup sync can iterate dialogs and save unsaved contacts (`client/src/screens/Inbox.tsx`).
+- Risk: Bulk contact additions can look abusive and may trigger FLOOD_WAIT/account limits. Also modifies user's real Telegram contacts - consent must be explicit.
+- Suggestion: Make Telegram address-book saving strictly opt-in with clear warning; default OFF. Add per-action confirmation or batch cap; throttle (e.g., 1 contact every few seconds), respect FLOOD_WAIT with visible pause; keep audit log; never auto-run full historical sync without explicit user action. Provide "CRM only" mode.
+
+[HIGH] No robust FLOOD_WAIT/backoff strategy for all write operations.
+- Evidence: FLOOD_WAIT handled in some login/scan paths (`client/src/lib/telegram.ts`, `Inbox.tsx`), but `sendLiveTelegramMessage`/`sendFile` and `AddContact` have no centralized backoff/retry policy.
+- Risk: Temporary bans, failed sends, repeated retries worsening limits.
+- Suggestion: Wrap all Telegram write calls in a per-account rate-limit queue with exponential backoff, FLOOD_WAIT respect, max retries, and user-visible status.
+
+[MEDIUM] "Unlimited translation" uses unofficial Google endpoint.
+- Evidence: `client/src/lib/translation.ts` calls `https://translate.googleapis.com/translate_a/single?client=gtx...`.
+- Risk: Unofficial endpoint may break, be blocked, or violate third-party terms. Sends message content to third party.
+- Suggestion: Disclose in privacy/UI. Make opt-in; allow disabling; consider official translation provider with ToS/SLA; avoid translating sensitive content by default; handle failures gracefully.
+
+[MEDIUM] Message/content privacy and consent.
+- Evidence: Messages/contact PII mirrored to server DB via `/sync/messages` and `/sync/batch-messages` (`server/src/routes/sync.js`), stored in MongoDB.
+- Risk: Privacy/compliance obligations (GDPR/CCPA/local laws), retention, breach exposure.
+- Suggestion: Publish privacy policy, retention/deletion policy, DPA/processor terms as needed. Add encryption-at-rest expectations, access controls, audit logs, data export/delete tooling. Minimize stored data.
+
+2. SECURITY
+[CRITICAL] CORS defaults to permissive when env not set.
+- Evidence: `server/src/app.js` uses `cors(allowedOrigin ? { origin: allowedOrigin, credentials: true } : undefined)`. If CORS_ORIGIN/CLIENT_ORIGIN is unset, cors() allows all origins.
+- Risk: Browser-based attacks against public API; credential/session exposure patterns become easier.
+- Suggestion: In production require explicit CORS allowlist; fail startup if missing. Default-deny.
+
+[HIGH] No global API rate limiting / abuse protection.
+- Evidence: express-rate-limit used on auth login/redeem (`server/src/routes/auth.js`) but not applied globally or on sync/chat/contact/template routes (`server/src/app.js`).
+- Risk: Brute force, resource exhaustion, DB cost spikes, scraping, sync abuse.
+- Suggestion: Add global rate limiter and stricter per-route limits (auth, sync, chats, admin). Add IP/user throttling and monitoring.
+
+[HIGH] Refresh tokens are stateless JWTs with no revocation/rotation.
+- Evidence: `server/src/services/tokenService.js` signs/verifies JWTs only; refresh endpoint issues new access token. No refresh token store/blacklist.
+- Risk: Stolen refresh token valid until expiry (default 30d); logout cannot invalidate existing tokens.
+- Suggestion: Store refresh token IDs/hashes server-side; rotate on use; revoke on logout/password change/device unlink; detect reuse.
+
+[HIGH] Error details leaked to clients.
+- Evidence: Global error handler returns `err.message` (`server/src/app.js`). Some auth DB errors return specific messages.
+- Risk: Internal details exposed; aids attackers.
+- Suggestion: Return generic client errors in production; log detailed errors server-side with correlation IDs. Redact sensitive fields.
+
+[HIGH] Large JSON body limit (16mb) and base64 media in messages.
+- Evidence: `app.use(express.json({ limit: '16mb' }))` in `server/src/app.js`; sync messages include `mediaRef` data URLs.
+- Risk: DoS/memory pressure, large DB docs, slow requests, cost. MongoDB doc limit 16MB.
+- Suggestion: Reduce default body limit; per-route limits. Use object storage/signed uploads for media instead of base64 in JSON/Mongo. Enforce max message/media size and count.
+
+[HIGH] Tauri CSP is null.
+- Evidence: `client/src-tauri/tauri.conf.json` `"security": { "csp": null }`.
+- Risk: Reduced defense-in-depth against XSS in webview.
+- Suggestion: Define strict CSP for Tauri v2, API endpoint, Telegram/translation endpoints as needed. Audit dependencies for XSS.
+
+[MEDIUM] Sensitive/local data stored in localStorage.
+- Evidence: translation cache, auto-save settings, telegram saved contacts set, drafts (`translation.ts`, `telegramLiveService.ts`, `Inbox.tsx`).
+- Risk: Accessible to webview JS; XSS or malicious dependency can read it.
+- Suggestion: Minimize sensitive data in localStorage; use Tauri secure storage for sensitive settings; clear on logout; add cache limits/TTL.
+
+[MEDIUM] Tracked .env.production in client.
+- Evidence: `client/.env.production` is tracked (`VITE_API_BASE_URL=/api/v1`).
+- Risk: Currently benign, but tracked env files are a common secret-leak path.
+- Suggestion: Track only .env.example; ignore real env files; add CI secret scanning.
+
+[MEDIUM] No schema validation for most request bodies.
+- Evidence: routes manually check some fields; sync/contact/message payloads not strictly schema-validated.
+- Risk: Bad data, unexpected fields, inconsistent DB state, abuse.
+- Suggestion: Add zod/joi validation with strict schemas, max lengths, enums, strip unknown fields.
+
+[MEDIUM] Telegram API credentials in client bundle (expected, but manage carefully).
+- Evidence: `VITE_TELEGRAM_API_ID/HASH` in `client/src/lib/telegram.ts`.
+- Risk: Extractable by anyone; abuse can get API ID banned. Inherent to client-side MTProto apps.
+- Suggestion: Use dedicated API ID/hash, monitor abuse, rotate if compromised, document acceptable use.
+
+[LOW] Logging/observability gaps.
+- Evidence: console logging, morgan tiny, no structured logs/metrics/tracing.
+- Risk: Hard to diagnose incidents; potential PII in logs.
+- Suggestion: Structured logger with redaction, request IDs, Sentry/monitoring, metrics and alerts.
+
+3. PERFORMANCE / SCALABILITY
+[HIGH] Bulk sync can be heavy and repeated.
+- Evidence: startup fetches dialogs and may save contacts/sync batches (`Inbox.tsx`, `telegramSync.ts`, `telegramLiveService.ts`).
+- Risk: Slow startup, UI jank, FLOOD_WAIT, network/battery drain.
+- Suggestion: Incremental sync with checkpoints/deltas; limit concurrency; avoid AddContact during initial sync; sync metadata first, lazy-load messages.
+
+[HIGH] Polling and large list queries.
+- Evidence: repeated-ids fetch every 30s, owner polls chats 30s, admin duplicates poll 30s; `Chat.find(...).limit(1000).populate(...)` in `chats.js`.
+- Risk: DB load/cost, slow responses as data grows.
+- Suggestion: Conditional polling, timestamp-cursor/changes endpoint, backoff when hidden, paginate/cursor list APIs, reduce populate fields.
+
+[HIGH] No message list virtualization.
+- Evidence: messages rendered via `messages.map(...)` in ChatThread (`Inbox.tsx`).
+- Risk: Slow render/memory on long conversations.
+- Suggestion: Virtualize message list (react-virtuoso/react-window), lazy-load media.
+
+[MEDIUM] Translation request/cache behavior.
+- Evidence: auto-translates recent messages sequentially with delay; cache in localStorage with simple hash keys and no eviction (`translation.ts`, `Inbox.tsx`).
+- Risk: Slow thread open, localStorage quota exhaustion, stale cache.
+- Suggestion: LRU/TTL cache with max entries; move to IndexedDB; translate visible messages only; cancel on chat switch.
+
+[MEDIUM] Contact lookup normalization/indexing.
+- Evidence: duplicateDetection uses case-insensitive regex username lookup and $or conditions; Contact has indexes but not normalized unique fields.
+- Risk: Regex lookups may degrade at scale; duplicate edge cases.
+- Suggestion: Store normalized usernameLower/phoneE164 fields with indexed exact matches; use collation where appropriate.
+
+[MEDIUM] Base64 media in memory/DB.
+- Evidence: data URLs for attachments/photos in state and message mediaRef.
+- Risk: High memory use, large documents, slow sync.
+- Suggestion: Use blobs/object URLs, compress/resize images, enforce size/count limits, move media to object storage.
+
+4. PRODUCTION READINESS / RELIABILITY
+[HIGH] No automated tests for critical flows.
+- Evidence: no test scripts in server/client package.json.
+- Risk: Regressions in auth, sync, duplicate detection, Telegram handling.
+- Suggestion: Add unit/integration/E2E tests; CI gate on test/lint/typecheck.
+
+[HIGH] Missing observability and ops controls.
+- Evidence: no structured logs/metrics/tracing/alerts.
+- Risk: Hard to diagnose production incidents.
+- Suggestion: Add Sentry, structured logs, metrics, health/readiness checks, alerting.
+
+[MEDIUM] Serverless constraints.
+- Evidence: Vercel-style API; owner/admin poll-based; no background worker.
+- Risk: Cold starts, timeouts, limited real-time/background processing.
+- Suggestion: Document constraints; use queue/worker/cron for heavy sync jobs if needed.
+
+[MEDIUM] Data lifecycle/retention gaps.
+- Evidence: no visible TTL/retention for messages, caches, logs.
+- Risk: Unbounded growth, privacy/compliance issues.
+- Suggestion: Define retention and deletion policies; implement purge/export tools.
+
+[MEDIUM] Dependency/supply-chain hygiene.
+- Evidence: no audit policy shown; critical deps (telegram, tauri, react).
+- Risk: Vulnerabilities/breaking changes.
+- Suggestion: Lockfiles, Dependabot/Renovate, npm audit in CI, careful GramJS upgrade testing.
+
+5. POSITIVE FINDINGS (KEEP)
+- Telegram session strings intended to remain local; server purges legacy sessionString field on startup (`server/src/server.js`).
+- JWT secrets validated for length/insecure placeholders (`server/src/services/tokenService.js`).
+- Auth middleware and role checks present; sync route checks telegramAccount ownership by org and ownerRefId.
+- Key MongoDB indexes exist for Chat/Message/TelegramAccount uniqueness.
+- Desktop updater artifacts/signing flow exists (ensure private key remains outside git - currently ignored).
+
+6. RECOMMENDED PRIORITY FIX ORDER
+1. Legal/compliance review for Telegram user-account automation + privacy/consent disclosures.
+2. Lock down CORS, add global/per-route rate limits, request schema validation, payload caps.
+3. Implement refresh token rotation/revocation and logout invalidation.
+4. Make AddContact/manual Telegram writes opt-in, throttled, FLOOD_WAIT-safe with audit UI.
+5. Replace base64 media-in-JSON with object storage/signed uploads; add media limits.
+6. Add observability, backups, retention/deletion policies.
+7. Performance pass: incremental sync, pagination/virtualization, cache eviction, DB query optimization.
+
+END OF REPORT
+
+
+8. FUNCTIONALITY / UX / CORRECTNESS (OBSERVED RISKS)
+[HIGH] Album/photo send is only partially represented in CRM sync.
+- Evidence: handleSend sends multiple files via sendLiveTelegramMessage but mirrors CRM with first preview data URL or placeholder [Photo] for additional items (client/src/screens/Inbox.tsx). Owner path records a single mediaRef.
+- Impact: Admin/owner history may miss actual media for 2nd+ album items; previews are data URLs, not durable media objects.
+- Suggestion: Upload each media file to object storage, store stable URLs/IDs per message; mirror one CRM message per Telegram message ID returned by album send; show proper album grouping in UI.
+
+[HIGH] Outgoing media send path depends on live MTProto client; fallback is limited.
+- Evidence: Live path sends through chatClient when connected. Non-live agent fallback syncs only; owner fallback records reply only.
+- Impact: Users may think a photo/message was sent when it was only recorded/synced; behavior differs by role/connection state.
+- Suggestion: Make send state explicit: "Sent to Telegram", "Recorded only", "Failed". Disable Telegram send when no live client for agent-owned chats or provide a clear queued/retry state.
+
+[MEDIUM] Duplicate/repeated detection depends on synced DB data.
+- Evidence: repeated IDs and admin duplicates come from server DB (/chats/repeated-ids, listChats filter=repeated); agent clients must sync.
+- Impact: Admin may see empty/stale duplicates until agents sync.
+- Suggestion: Show last sync time per agent, manual "Sync now", background sync indicator, and clearer empty-state explanation.
+
+[MEDIUM] Translation feature has UX/consistency gaps.
+- Evidence: auto-translate covers recent 20 incoming messages; older messages use manual Translate button; send-translate UI exists. Cache is localStorage with no eviction.
+- Impact: Mixed translated/untranslated history; stale cache after language change; possible storage quota issues.
+- Suggestion: Add "Translate visible/conversation" with progress/cancel; show source/target language; use LRU/TTL cache in IndexedDB; invalidate by target language.
+
+[MEDIUM] Draft/attachment model migration is shallow.
+- Evidence: attachments state reads legacy entry.attachment fallback but draftStore now uses attachments[].
+- Impact: Old drafts may behave inconsistently; multiple attachment drafts lack robust validation/limits.
+- Suggestion: Versioned draft schema migration, size/count limits, cleanup on logout.
+
+[MEDIUM] Chat/message loading has race and staleness edge cases.
+- Evidence: multiple async fetches (loadChats, live subscriptions, DB fallback, polls) update same state.
+- Impact: Possible stale overwrite, duplicates, missing latest messages on reconnect, or flicker.
+- Suggestion: Single chat store/reducer per scope; guard updates by request/chat generation; reconcile by telegramMessageId; add E2E reconnect/switch tests.
+
+[MEDIUM] Contact save/name behavior can confuse users.
+- Evidence: auto-save can create CRM savedName and optionally add to Telegram contacts; Telegram-saved vs CRM-saved are different concepts.
+- Impact: Users may expect Telegram contacts to be updated or be surprised contacts were added.
+- Suggestion: Clear labels "Save in CRM" vs "Save in Telegram address book"; audit/history; undo; default Telegram saving OFF.
+
+[LOW] Accessibility and error feedback gaps.
+- Evidence: some icon-only controls, inconsistent error toasts vs console/silent catches.
+- Impact: Harder keyboard/screen-reader use; users cannot diagnose send/sync/translation failures.
+- Suggestion: Consistent aria-labels/focus states, centralized user-facing error toasts with action guidance.
+
+END OF FUNCTIONALITY ADDENDUM

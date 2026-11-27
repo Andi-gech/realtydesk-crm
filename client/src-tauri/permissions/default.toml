@@ -2,3 +2,24 @@
 identifier = "allow-keyring"
 description = "Access OS keyring commands used for secure local storage"
 commands.allow = ["keyring_set", "keyring_get", "keyring_delete"]
+
+[[permission]]
+identifier = "allow-local-cache"
+description = "Device-local SQLite chat/message cache and disk media store commands"
+commands.allow = [
+  "cache_chats_replace",
+  "cache_chats_load",
+  "cache_chats_load_stream",
+  "cache_chats_search",
+  "cache_messages_put",
+  "cache_messages_load",
+  "cache_messages_load_stream",
+  "cache_clear",
+  "media_store",
+  "toast_show",
+]
+
+[[permission]]
+identifier = "allow-debug-log"
+description = "Append diagnostic lines to the local debug log"
+commands.allow = ["debug_log"]

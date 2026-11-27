@@ -10,7 +10,7 @@ import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { computeCheck } from 'telegram/Password';
 import { NewMessage, NewMessageEvent } from 'telegram/events';
-import { saveSession, loadSession } from './secureStorage';
+import { saveSession, loadSession, deleteSession } from './secureStorage';
 import QRCode from 'qrcode';
 
 const API_ID = Number(import.meta.env.VITE_TELEGRAM_API_ID || 0);
@@ -482,27 +482,59 @@ function startKeepAlive(): void {
   }, 45_000);
 }
 
+const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+type ActivateResult = 'ok' | 'offline' | 'dead';
+
+function isAuthDeadError(err: any): boolean {
+  const msg = String(err?.errorMessage || err?.message || '').toUpperCase();
+  return (
+    msg.includes('AUTH_KEY_UNREGISTERED') ||
+    msg.includes('AUTH_KEY_INVALID') ||
+    msg.includes('SESSION_REVOKED') ||
+    msg.includes('SESSION_EXPIRED') ||
+    msg.includes('USER_DEACTIVATED') ||
+    msg.includes('USER_DEACTIVATED_BAN')
+  );
+}
+
 /**
  * Connects a client and makes sure Telegram actually starts pushing updates.
  * `updates.GetState` registers this connection for update delivery — without
  * it some sessions stay connected but never receive live events.
  */
-async function activateClient(client: TelegramClient): Promise<boolean> {
+async function activateClient(client: TelegramClient): Promise<ActivateResult> {
   try {
     if (!client.connected) {
-      await client.connect();
+      await withTimeout(client.connect(), 12000);
     }
-    if (!client.connected) return false;
+    if (!client.connected) return 'offline';
     // Caches the self input peer (needed by the event dispatcher) and confirms
     // the session is still authorised.
-    await client.getMe();
+    await withTimeout(client.getMe(), 10000);
     try {
-      await client.invoke(new Api.updates.GetState());
+      await withTimeout(client.invoke(new Api.updates.GetState()), 8000);
     } catch {}
-    return client.connected;
+    return client.connected ? 'ok' : 'offline';
   } catch (err) {
+    if (isAuthDeadError(err)) {
+      console.warn('[telegram] Session is no longer valid:', err);
+      return 'dead';
+    }
     console.warn('[telegram] Failed to activate client:', err);
-    return false;
+    return 'offline';
   }
 }
 
@@ -514,11 +546,21 @@ export async function getActiveTelegramClient(telegramAccountId: string): Promis
       return cached;
     }
     // Reconnect the SAME instance so already-registered event handlers survive.
-    if (await activateClient(cached)) return cached;
+    const status = await activateClient(cached);
+    if (status === 'ok') {
+      startKeepAlive();
+      return cached;
+    }
+    if (status === 'dead') {
+      clientCache.delete(telegramAccountId);
+      try { await cached.destroy(); } catch {}
+      await deleteSession(telegramAccountId).catch(() => {});
+      return null;
+    }
+    // Transient network/offline failure: keep cached client and session.
+    return null;
   }
-  const newClient = await reconnect(telegramAccountId);
-  if (newClient) clientCache.set(telegramAccountId, newClient);
-  return newClient;
+  return reconnect(telegramAccountId);
 }
 
 /**
@@ -533,9 +575,19 @@ export async function reconnect(telegramAccountId: string): Promise<TelegramClie
     // Prefer the existing instance so live event handlers keep working.
     const cached = clientCache.get(telegramAccountId);
     if (cached) {
-      if (await activateClient(cached)) return cached;
-      clientCache.delete(telegramAccountId);
-      try { await cached.destroy(); } catch {}
+      const status = await activateClient(cached);
+      if (status === 'ok') {
+        startKeepAlive();
+        return cached;
+      }
+      if (status === 'dead') {
+        clientCache.delete(telegramAccountId);
+        try { await cached.destroy(); } catch {}
+        await deleteSession(telegramAccountId).catch(() => {});
+        return null;
+      }
+      // Offline/transient: keep instance for future retries, do not destroy session.
+      return null;
     }
 
     const sessionString = await loadSession(telegramAccountId);
@@ -554,15 +606,17 @@ export async function reconnect(telegramAccountId: string): Promise<TelegramClie
         systemVersion: 'Windows 11',
         appVersion: '1.0.0',
       });
-      const ok = await activateClient(client);
-      if (!ok) {
-        console.warn('[telegram] reconnect: client.connected is false for account:', telegramAccountId);
-        try { await client.destroy(); } catch {}
-        return null;
+      const status = await activateClient(client);
+      if (status === 'ok') {
+        clientCache.set(telegramAccountId, client);
+        startKeepAlive();
+        return client;
       }
-      clientCache.set(telegramAccountId, client);
-      startKeepAlive();
-      return client;
+      try { await client.destroy(); } catch {}
+      if (status === 'dead') {
+        await deleteSession(telegramAccountId).catch(() => {});
+      }
+      return null;
     } catch (err) {
       console.warn('[telegram] reconnect failed for account:', telegramAccountId, err);
       return null;

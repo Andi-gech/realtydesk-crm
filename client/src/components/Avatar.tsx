@@ -70,6 +70,7 @@ export const Avatar: React.FC<AvatarProps> = memo(({ name = '', id = '', photoUr
           src={photoUrl!}
           alt={name}
           loading="lazy"
+          decoding="async"
           className="tg-avatar-img"
           onError={() => setImgFailed(true)}
         />

@@ -9,6 +9,8 @@ import { SettingsIcon } from './components/Icons';
 import BrandMark from './components/BrandMark';
 import { check as checkForUpdate } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
+import { sendTestNotification, forceTestNotification } from './lib/notifications';
+import { invoke } from '@tauri-apps/api/core';
 
 type Role = 'agent' | 'owner';
 type View = 'inbox' | 'add_telegram' | 'owner_admin';
@@ -53,6 +55,19 @@ export default function App() {
     }
   });
 
+  // Settings header action: verify OS notifications are reachable.
+  const [notifyTest, setNotifyTest] = useState<
+    'idle' | 'sending' | 'ok' | 'fail'
+  >('idle');
+
+  const runNotifyTest = async () => {
+    if (notifyTest === 'sending') return;
+    setNotifyTest('sending');
+    const ok = await forceTestNotification();
+    setNotifyTest(ok ? 'ok' : 'fail');
+    window.setTimeout(() => setNotifyTest('idle'), 3000);
+  };
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
     try {
@@ -61,6 +76,17 @@ export default function App() {
   }, [theme]);
 
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+
+  useEffect(() => {
+    // Diagnostic: confirm the frontend reached App and can talk to Rust.
+    invoke('debug_log', { message: 'App mounted' }).catch((e: unknown) => {
+      console.error('[diag] App mounted log failed', e);
+    });
+    const t = setTimeout(() => {
+      sendTestNotification().catch(() => {});
+    }, 3000);
+    return () => clearTimeout(t);
+  }, []);
 
   // Force logout if the server rejects our session (e.g. admin deleted the account).
   useEffect(() => {
@@ -304,6 +330,21 @@ export default function App() {
         </nav>
 
         <div className="header-actions">
+          <button
+            type="button"
+            className="logout-btn"
+            onClick={runNotifyTest}
+            disabled={notifyTest === 'sending'}
+            title="Send a test push notification"
+          >
+            {notifyTest === 'sending'
+              ? 'Testing\u2026'
+              : notifyTest === 'ok'
+                ? 'Notification sent'
+                : notifyTest === 'fail'
+                  ? 'Blocked \u2014 check Windows settings'
+                  : 'Test notification'}
+          </button>
           <button
             type="button"
             className="logout-btn"
