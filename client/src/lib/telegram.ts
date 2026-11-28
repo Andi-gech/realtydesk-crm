@@ -84,7 +84,7 @@ export async function requestTelegramPhoneCode(
 
   const session = new StringSession('');
   const client = new TelegramClient(session, API_ID, API_HASH, {
-    connectionRetries: 5,
+    connectionRetries: 10,
     useWSS: true, // Secure WebSocket connection
     deviceModel: 'Telegram Desktop',
     systemVersion: 'Windows 11',
@@ -315,7 +315,7 @@ export async function startTelegramQrLogin(
 
   const session = new StringSession('');
   const client = new TelegramClient(session, API_ID, API_HASH, {
-    connectionRetries: 5,
+    connectionRetries: 10,
     useWSS: true,
     deviceModel: 'Desktop Windows',
     systemVersion: 'Windows 11',
@@ -426,6 +426,19 @@ const clientCache = new Map<string, TelegramClient>();
 // sockets with the same auth key — Telegram then pushes updates to only one of
 // them, and handlers attached to the other never fire.
 const pendingConnections = new Map<string, Promise<TelegramClient | null>>();
+const clientFailures = new Map<string, { count: number; firstAt: number }>();
+
+function clearClientFailure(accountId: string) {
+  clientFailures.delete(accountId);
+}
+
+async function resetStaleClient(accountId: string, client: TelegramClient | undefined) {
+  clientFailures.delete(accountId);
+  clientCache.delete(accountId);
+  if (client) {
+    try { await client.destroy(); } catch {}
+  }
+}
 
 /**
  * Registers an already-authenticated client (the one used during `+ Add
@@ -448,6 +461,7 @@ export function getCachedTelegramClient(telegramAccountId: string): TelegramClie
 }
 
 export async function destroyTelegramClient(telegramAccountId: string): Promise<void> {
+  clearClientFailure(telegramAccountId);
   const client = clientCache.get(telegramAccountId);
   clientCache.delete(telegramAccountId);
   if (client) {
@@ -473,13 +487,13 @@ function startKeepAlive(): void {
       try {
         await Promise.race([
           client.getDialogs({ limit: 1 }),
-          new Promise((resolve) => setTimeout(resolve, 8000)),
+          new Promise((resolve) => setTimeout(resolve, 15000)),
         ]);
       } catch {
         // A failed keep-alive is harmless; the watchdog reconnects if needed.
       }
     }
-  }, 45_000);
+  }, 30_000);
 }
 
 const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
@@ -518,14 +532,14 @@ function isAuthDeadError(err: any): boolean {
 async function activateClient(client: TelegramClient): Promise<ActivateResult> {
   try {
     if (!client.connected) {
-      await withTimeout(client.connect(), 12000);
+      await withTimeout(client.connect(), 25000);
     }
     if (!client.connected) return 'offline';
     // Caches the self input peer (needed by the event dispatcher) and confirms
     // the session is still authorised.
-    await withTimeout(client.getMe(), 10000);
+    await withTimeout(client.getMe(), 15000);
     try {
-      await withTimeout(client.invoke(new Api.updates.GetState()), 8000);
+      await withTimeout(client.invoke(new Api.updates.GetState()), 10000);
     } catch {}
     return client.connected ? 'ok' : 'offline';
   } catch (err) {
@@ -542,22 +556,32 @@ export async function getActiveTelegramClient(telegramAccountId: string): Promis
   const cached = clientCache.get(telegramAccountId);
   if (cached) {
     if (cached.connected) {
+      clearClientFailure(telegramAccountId);
       startKeepAlive();
       return cached;
     }
     // Reconnect the SAME instance so already-registered event handlers survive.
     const status = await activateClient(cached);
     if (status === 'ok') {
+      clearClientFailure(telegramAccountId);
       startKeepAlive();
       return cached;
     }
     if (status === 'dead') {
+      clearClientFailure(telegramAccountId);
       clientCache.delete(telegramAccountId);
       try { await cached.destroy(); } catch {}
       await deleteSession(telegramAccountId).catch(() => {});
       return null;
     }
-    // Transient network/offline failure: keep cached client and session.
+    const f = clientFailures.get(telegramAccountId) || { count: 0, firstAt: Date.now() };
+    f.count += 1;
+    clientFailures.set(telegramAccountId, f);
+    // After long/stuck disconnection, recreate the client instance from session.
+    if (f.count >= 4 || Date.now() - f.firstAt > 90_000) {
+      console.warn('[telegram] Resetting stale client after repeated failures:', telegramAccountId);
+      await resetStaleClient(telegramAccountId, cached);
+    }
     return null;
   }
   return reconnect(telegramAccountId);
@@ -577,16 +601,24 @@ export async function reconnect(telegramAccountId: string): Promise<TelegramClie
     if (cached) {
       const status = await activateClient(cached);
       if (status === 'ok') {
+        clearClientFailure(telegramAccountId);
         startKeepAlive();
         return cached;
       }
       if (status === 'dead') {
+        clearClientFailure(telegramAccountId);
         clientCache.delete(telegramAccountId);
         try { await cached.destroy(); } catch {}
         await deleteSession(telegramAccountId).catch(() => {});
         return null;
       }
-      // Offline/transient: keep instance for future retries, do not destroy session.
+      const f = clientFailures.get(telegramAccountId) || { count: 0, firstAt: Date.now() };
+      f.count += 1;
+      clientFailures.set(telegramAccountId, f);
+      if (f.count >= 4 || Date.now() - f.firstAt > 90_000) {
+        console.warn('[telegram] Resetting stale client after repeated failures:', telegramAccountId);
+        await resetStaleClient(telegramAccountId, cached);
+      }
       return null;
     }
 
@@ -600,7 +632,7 @@ export async function reconnect(telegramAccountId: string): Promise<TelegramClie
 
     try {
       const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, {
-        connectionRetries: 3,
+        connectionRetries: 8,
         useWSS: true,
         deviceModel: 'Desktop Windows',
         systemVersion: 'Windows 11',
@@ -608,13 +640,19 @@ export async function reconnect(telegramAccountId: string): Promise<TelegramClie
       });
       const status = await activateClient(client);
       if (status === 'ok') {
+        clearClientFailure(telegramAccountId);
         clientCache.set(telegramAccountId, client);
         startKeepAlive();
         return client;
       }
       try { await client.destroy(); } catch {}
       if (status === 'dead') {
+        clearClientFailure(telegramAccountId);
         await deleteSession(telegramAccountId).catch(() => {});
+      } else {
+        const f = clientFailures.get(telegramAccountId) || { count: 0, firstAt: Date.now() };
+        f.count += 1;
+        clientFailures.set(telegramAccountId, f);
       }
       return null;
     } catch (err) {

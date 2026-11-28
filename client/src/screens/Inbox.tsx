@@ -6,7 +6,7 @@ import BrandMark from '../components/BrandMark';
 import { getCachedAvatar, subscribeAvatarUpdates, bufferToDataUrl } from '../lib/avatarCache';
 import { translateText, getTargetLanguage } from '../lib/translation';
 import { deleteSession, loadSession } from '../lib/secureStorage';
-import { destroyTelegramClient } from '../lib/telegram';
+import { destroyTelegramClient, getActiveTelegramClient } from '../lib/telegram';
 import { storeMediaDataUrl } from '../lib/mediaStore';
 import { registerNotificationClickHandler, notifyNewMessage, sendTestNotification, forceTestNotification } from '../lib/notifications';
 import { useVirtualRows } from '../lib/useVirtualRows';
@@ -23,6 +23,8 @@ import {
   fetchLiveTelegramChats,
   fetchLiveTelegramMessages,
   sendLiveTelegramMessage,
+  sendLiveTelegramTemplate,
+  sendTelegramFilesRaw,
   subscribeLiveTelegramUpdates,
   chatMatchesPeer,
   buildLiveChatFromPeer,
@@ -271,6 +273,99 @@ function getChatKey(chat: any): string {
   return `${getChatAccountId(chat)}_${String(chat?.externalChatId || chat?._id || '')}`;
 }
 
+/**
+ * Stable identity used by the daily counters. Telegram's user/chat id survives
+ * the live -> DB merge (where `_id` appears and `externalChatId` may change
+ * shape), so one client always maps to one key and is never counted twice.
+ */
+function getClientStatKey(chat: any): string {
+  const contact = chat?.contactId;
+  const telegramUserId = contact?.telegramUserId;
+  if (telegramUserId) return `tg:${String(telegramUserId)}`;
+  if (contact?._id) return `contact:${String(contact._id)}`;
+  const external = chat?.externalChatId;
+  if (external) return `chat:${getChatAccountId(chat)}:${String(external)}`;
+  if (chat?._id) return `id:${String(chat._id)}`;
+  return '';
+}
+
+type DailyStatEntry = { count: number; names: string[]; ids: string[] };
+
+const DAILY_INCOMING_KEY = 'rd_daily_incoming';
+const DAILY_ARCHIVED_KEY = 'rd_daily_archived';
+const DAILY_TRANSFERRED_KEY = 'rd_daily_transferred';
+const KNOWN_CLIENT_IDS_KEY = 'rd_known_client_ids';
+const STATS_VERSION_KEY = 'rd_stats_version';
+const STATS_VERSION = '2';
+
+function todayKey(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function readKnownClientIds(): string[] {
+  try {
+    const raw = localStorage.getItem(KNOWN_CLIENT_IDS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((n: any) => typeof n === 'string' && n.trim())
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeKnownClientIds(ids: string[]): void {
+  try {
+    localStorage.setItem(
+      KNOWN_CLIENT_IDS_KEY,
+      JSON.stringify(Array.from(new Set(ids)).slice(0, 5000))
+    );
+  } catch {}
+}
+
+/**
+ * Marks every client already present in the inbox as "known" without touching
+ * any counter. This is what stops existing/repeat clients from being counted
+ * as new when they send their next live message.
+ */
+function seedKnownClients(chats: any[]): void {
+  if (!Array.isArray(chats) || chats.length === 0) return;
+  const known = new Set(readKnownClientIds());
+  const before = known.size;
+  for (const chat of chats) {
+    const key = getClientStatKey(chat);
+    if (key) known.add(key);
+  }
+  if (known.size !== before) writeKnownClientIds(Array.from(known));
+}
+
+function readDailyStatEntry(key: string): DailyStatEntry {
+  const empty: DailyStatEntry = { count: 0, names: [], ids: [] };
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return empty;
+    const parsed = JSON.parse(raw);
+    if (parsed?.date !== todayKey()) return empty;
+    return {
+      count: typeof parsed.count === 'number' ? parsed.count : 0,
+      names: Array.isArray(parsed.names)
+        ? parsed.names.filter((n: any) => typeof n === 'string' && n.trim()).slice(0, 50)
+        : [],
+      ids: Array.isArray(parsed.ids)
+        ? parsed.ids.filter((n: any) => typeof n === 'string' && n.trim()).slice(0, 200)
+        : [],
+    };
+  } catch {
+    return empty;
+  }
+}
+
+function writeDailyStatEntry(key: string, entry: DailyStatEntry): void {
+  try {
+    localStorage.setItem(key, JSON.stringify({ date: todayKey(), ...entry }));
+  } catch {}
+}
+
 // On narrow screens the thread overlays the list, so we must not auto-open a
 // conversation on load ΓÇö the user should land on the conversation list instead.
 function isNarrowViewport(): boolean {
@@ -303,7 +398,12 @@ function mergeLiveAndDbChats(liveChats: any[], dbChats: any[]): any[] {
         _id: match._id || liveChat._id,
         isArchived: Boolean(match.isArchived !== undefined ? match.isArchived : liveChat.isArchived),
         isTransferred: Boolean(
-          match.isTransferred || liveChat.isTransferred || containsTmeLink(liveChat.lastMessagePreview)
+          match.isTransferred ||
+            liveChat.isTransferred ||
+            containsTmeLink(liveChat.lastMessagePreview) ||
+            isEverTransferred(match._id) ||
+            isEverTransferred(match.externalChatId) ||
+            isEverTransferred(liveChat.externalChatId)
         ),
         agentId: match.agentId || liveChat.agentId,
         telegramAccountId: liveChat.telegramAccountId || match.telegramAccountId,
@@ -337,6 +437,109 @@ function mergeLiveAndDbChats(liveChats: any[], dbChats: any[]): any[] {
     }
   }
   return combined.length > 0 ? combined : dbChats;
+}
+
+function chatSortTime(chat: any): number {
+  const t = chat?.lastMessageAt ? new Date(chat.lastMessageAt).getTime() : 0;
+  return Number.isFinite(t) ? t : 0;
+}
+
+function sortChatsByRecent(chats: any[]): any[] {
+  return [...chats].sort((a, b) => chatSortTime(b) - chatSortTime(a));
+}
+
+function dedupeChatsByKey(chats: any[]): any[] {
+  const seen = new Set<string>();
+  const out: any[] = [];
+  for (const chat of chats) {
+    const key = getChatKey(chat);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(chat);
+  }
+  return out;
+}
+
+/**
+ * Merge an authoritative fetched list into the current list without rolling back
+ * fresher live updates. Incoming provides structure/authoritative CRM fields;
+ * previous wins for newer last message/unread when it is clearly fresher.
+ */
+function mergeChatLists(
+  prev: any[],
+  incoming: any[],
+  selectedChatId?: string | null,
+  keepKeys?: Set<string>
+): any[] {
+  const prevMap = new Map<string, any>();
+  for (const c of prev) prevMap.set(getChatKey(c), c);
+
+  const merged = incoming.map((inc) => {
+    const key = getChatKey(inc);
+    const old = prevMap.get(key);
+    if (!old) {
+      const selected = selectedChatId && (inc._id === selectedChatId || inc.externalChatId === selectedChatId);
+      return selected ? { ...inc, unreadCount: 0 } : inc;
+    }
+
+    const incTs = chatSortTime(inc);
+    const oldTs = chatSortTime(old);
+    const oldIsNewer = oldTs > incTs + 1000;
+    const selected = Boolean(
+      selectedChatId &&
+        (inc._id === selectedChatId ||
+          inc.externalChatId === selectedChatId ||
+          old._id === selectedChatId ||
+          old.externalChatId === selectedChatId)
+    );
+
+    const base: any = {
+      ...old,
+      ...inc,
+      entity: inc.entity || old.entity,
+      inputEntity: inc.inputEntity || old.inputEntity,
+      telegramAccountId: inc.telegramAccountId || old.telegramAccountId,
+      telegramAccount: inc.telegramAccount || old.telegramAccount,
+      lastMessageDirection: inc.lastMessageDirection || old.lastMessageDirection,
+      contactId: {
+        ...(old.contactId || {}),
+        ...(inc.contactId || {}),
+        avatarUrl: inc.contactId?.avatarUrl || old.contactId?.avatarUrl,
+        savedName: inc.contactId?.savedName || old.contactId?.savedName,
+        displayName: inc.contactId?.displayName || old.contactId?.displayName,
+        firstName: inc.contactId?.firstName || old.contactId?.firstName,
+        lastName: inc.contactId?.lastName || old.contactId?.lastName,
+        username: inc.contactId?.username || old.contactId?.username,
+        phoneNumber: inc.contactId?.phoneNumber || old.contactId?.phoneNumber,
+      },
+    };
+
+    if (oldIsNewer) {
+      base.lastMessageAt = old.lastMessageAt;
+      base.lastMessagePreview = old.lastMessagePreview ?? inc.lastMessagePreview;
+      base.lastMessageDirection = old.lastMessageDirection || inc.lastMessageDirection;
+      base.unreadCount = selected ? 0 : Math.max(Number(old.unreadCount || 0), Number(inc.unreadCount || 0));
+    } else {
+      base.lastMessageAt = inc.lastMessageAt || old.lastMessageAt;
+      base.lastMessagePreview = inc.lastMessagePreview ?? old.lastMessagePreview;
+      base.lastMessageDirection = inc.lastMessageDirection || old.lastMessageDirection;
+      base.unreadCount = selected ? 0 : Number(inc.unreadCount ?? old.unreadCount ?? 0);
+    }
+
+    if (selected) base.unreadCount = 0;
+    return base;
+  });
+
+  // Keep pending/live-only chats that were not present in the fetched snapshot.
+  if (keepKeys && keepKeys.size > 0) {
+    for (const old of prev) {
+      const key = getChatKey(old);
+      if (!key || merged.some((c) => getChatKey(c) === key)) continue;
+      if (keepKeys.has(key)) merged.push(old);
+    }
+  }
+
+  return sortChatsByRecent(dedupeChatsByKey(merged));
 }
 
 type DraftAttachment = { file: File; dataUrl: string };
@@ -586,13 +789,29 @@ const ChatItem = memo(function ChatItem({
 
         <div className="chat-row-bottom">
           <p className="chat-preview">
-            {chat.lastMessagePreview === '[Media]' || chat.lastMessagePreview === '[Photo]' || chat.lastMessagePreview?.startsWith('data:image') ? (
-              <span className="chat-preview-media">
-                <PhotoIcon size={13} /> Photo
-              </span>
-            ) : (
-              chat.lastMessagePreview || 'No messages yet'
-            )}
+            {(() => {
+              const draftKey = String(chat.externalChatId || chat._id || '');
+              const draft = draftStore.get(draftKey);
+              if (draft?.text?.trim()) {
+                return <><span className="chat-preview-draft">Draft: </span>{draft.text.trim()}</>;
+              }
+              const raw = String(chat.lastMessagePreview || '');
+              const prefix = chat.lastMessageDirection === 'out' ? <span className="chat-preview-prefix">You: </span> : null;
+              const mediaLabel =
+                raw === '[Photo]' || raw.startsWith('data:image') ? 'Photo'
+                : raw === '[Video]' ? 'Video'
+                : raw === '[Voice]' || raw === '[Voice message]' ? 'Voice message'
+                : raw === '[Audio]' ? 'Audio'
+                : raw === '[GIF]' ? 'GIF'
+                : raw === '[Sticker]' ? 'Sticker'
+                : raw === '[File]' || raw === '[Document]' ? 'File'
+                : raw === '[Media]' ? 'Media'
+                : null;
+              if (mediaLabel) {
+                return <span className="chat-preview-media">{prefix}<PhotoIcon size={13} /> {mediaLabel}</span>;
+              }
+              return raw ? <>{prefix}{raw}</> : 'No messages yet';
+            })()}
           </p>
           <div className="chat-row-badges">
             {isBlocked && (
@@ -623,6 +842,34 @@ type Props = {
   onAddTelegram?: () => void;
 };
 
+const TRANSFERRED_IDS_KEY = 'rd_transferred_ids';
+
+function getTransferredIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(TRANSFERRED_IDS_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return new Set();
+    return new Set(arr.map(String));
+  } catch {
+    return new Set();
+  }
+}
+
+function markTransferredSticky(id: string | number | undefined | null) {
+  if (id === undefined || id === null || id === '') return;
+  try {
+    const set = getTransferredIds();
+    set.add(String(id));
+    localStorage.setItem(TRANSFERRED_IDS_KEY, JSON.stringify(Array.from(set)));
+  } catch {}
+}
+
+function isEverTransferred(id: string | number | undefined | null): boolean {
+  if (id === undefined || id === null || id === '') return false;
+  return getTransferredIds().has(String(id));
+}
+
 export default function Inbox({ role, onAddTelegram }: Props) {
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
@@ -643,15 +890,140 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   const [showTemplates, setShowTemplates] = useState(false);
   const [newTemplateTitle, setNewTemplateTitle] = useState('');
   const [newTemplateBody, setNewTemplateBody] = useState('');
+  const [newTemplateFiles, setNewTemplateFiles] = useState<File[]>([]);
   const [showCreateTemplate, setShowCreateTemplate] = useState(false);
+  const [creatingTemplate, setCreatingTemplate] = useState(false);
   const [telegramAccounts, setTelegramAccounts] = useState<any[]>([]);
   const [, setAllOrgAccounts] = useState<any[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // Daily stats panel (toggleable) — counts new clients/archived/transferred for today.
+  const [dailyStatsOpen, setDailyStatsOpen] = useState(() => {
+    try { return localStorage.getItem('rd_daily_stats_open') === '1'; } catch { return false; }
+  });
+  const [dailyStats, setDailyStats] = useState<Record<'incoming' | 'archived' | 'transferred', DailyStatEntry>>({
+    incoming: { count: 0, names: [], ids: [] },
+    archived: { count: 0, names: [], ids: [] },
+    transferred: { count: 0, names: [], ids: [] },
+  });
+
+  const readDailyStat = useCallback((key: string): DailyStatEntry => readDailyStatEntry(key), []);
+
+  const refreshDailyStats = useCallback(() => {
+    setDailyStats({
+      incoming: readDailyStat(DAILY_INCOMING_KEY),
+      archived: readDailyStat(DAILY_ARCHIVED_KEY),
+      transferred: readDailyStat(DAILY_TRANSFERRED_KEY),
+    });
+  }, [readDailyStat]);
+
+  const resetDailyStats = useCallback(() => {
+    if (!window.confirm("Reset today's counters?")) return;
+    try {
+      localStorage.removeItem(DAILY_INCOMING_KEY);
+      localStorage.removeItem(DAILY_ARCHIVED_KEY);
+      localStorage.removeItem(DAILY_TRANSFERRED_KEY);
+    } catch {}
+    refreshDailyStats();
+  }, [refreshDailyStats]);
+
+  // Adds one distinct entry to a daily counter. The id dedupes so the same
+  // client can never inflate a counter twice in one day.
+  const bumpDailyStat = useCallback((key: 'incoming' | 'archived' | 'transferred', name: string, id: string) => {
+    const statKey =
+      key === 'incoming' ? DAILY_INCOMING_KEY : key === 'archived' ? DAILY_ARCHIVED_KEY : DAILY_TRANSFERRED_KEY;
+    const current = readDailyStatEntry(statKey);
+    if (id && current.ids.includes(id)) return;
+    const cleanName = String(name || '').trim();
+    writeDailyStatEntry(statKey, {
+      count: current.count + 1,
+      names: cleanName ? [cleanName, ...current.names.filter((n) => n !== cleanName)].slice(0, 50) : current.names,
+      ids: id ? [id, ...current.ids.filter((n) => n !== id)].slice(0, 200) : current.ids,
+    });
+  }, []);
+
+  // Incoming = brand-new clients only (first time this client is ever seen).
+  const countNewClient = useCallback((chat: any) => {
+    const id = getClientStatKey(chat);
+    if (!id) return;
+    if (readDailyStatEntry(DAILY_INCOMING_KEY).ids.includes(id)) return;
+    const known = new Set(readKnownClientIds());
+    if (known.has(id)) return;
+    known.add(id);
+    writeKnownClientIds(Array.from(known));
+    bumpDailyStat('incoming', getChatDisplayName(chat), id);
+    refreshDailyStats();
+  }, [bumpDailyStat, refreshDailyStats]);
+
+  // Archived = only clients that were counted as new/incoming today.
+  const countArchived = useCallback((chat: any) => {
+    const id = getClientStatKey(chat);
+    if (!id) return;
+    if (!readDailyStatEntry(DAILY_INCOMING_KEY).ids.includes(id)) return;
+    bumpDailyStat('archived', getChatDisplayName(chat), id);
+    refreshDailyStats();
+  }, [bumpDailyStat, refreshDailyStats]);
+
+  // Transferred = both old and new clients, so there is no incoming gate.
+  const countTransferred = useCallback((chat: any) => {
+    const id = getClientStatKey(chat);
+    if (!id) return;
+    bumpDailyStat('transferred', getChatDisplayName(chat), id);
+    refreshDailyStats();
+  }, [bumpDailyStat, refreshDailyStats]);
+
+  // One-time migration: totals produced by the old logic were unreliable, so
+  // reset today's counters once. Known ids are kept and reseeded below.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(STATS_VERSION_KEY) !== STATS_VERSION) {
+        localStorage.removeItem(DAILY_INCOMING_KEY);
+        localStorage.removeItem(DAILY_ARCHIVED_KEY);
+        localStorage.removeItem(DAILY_TRANSFERRED_KEY);
+        localStorage.setItem(STATS_VERSION_KEY, STATS_VERSION);
+      }
+    } catch {}
+    refreshDailyStats();
+  }, [refreshDailyStats]);
+
+  // Keep the "known clients" set in sync with the inbox so existing clients are
+  // never treated as new when their next message arrives.
+  useEffect(() => {
+    seedKnownClients(chats);
+  }, [chats]);
+
+  const toggleDailyStats = useCallback(() => {
+    setDailyStatsOpen((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('rd_daily_stats_open', next ? '1' : '0'); } catch {}
+      if (next) refreshDailyStats();
+      return next;
+    });
+  }, [refreshDailyStats]);
   const [, setAvatarRev] = useState(0);
   const [connectedAccounts, setConnectedAccounts] = useState(0);
   // Aggregate live-socket health across all linked accounts.
   const [liveStatus, setLiveStatus] = useState<LiveStatus>('connecting');
+  const [displayLiveStatus, setDisplayLiveStatus] = useState<LiveStatus>('connecting');
+  const liveStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (liveStatusTimerRef.current) {
+      clearTimeout(liveStatusTimerRef.current);
+      liveStatusTimerRef.current = null;
+    }
+    if (liveStatus === 'live') {
+      setDisplayLiveStatus('live');
+      return;
+    }
+    // Debounce transient connecting states to avoid UI flap on slow networks.
+    // Waiting for OS network is shown immediately.
+    const delay = liveStatus === 'waiting' ? 0 : 2500;
+    liveStatusTimerRef.current = setTimeout(() => setDisplayLiveStatus(liveStatus), delay);
+    return () => {
+      if (liveStatusTimerRef.current) clearTimeout(liveStatusTimerRef.current);
+    };
+  }, [liveStatus]);
   // Guards against fetching the same brand-new chat several times in a burst.
   const unknownChatFetches = useRef<Set<string>>(new Set());
   // Latest chat list for use inside live-update handlers (which are bound once).
@@ -688,6 +1060,10 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   useEffect(() => {
     selectedChatIdRef.current = selectedChatId;
   }, [selectedChatId]);
+
+  useEffect(() => {
+    refreshDailyStats();
+  }, [refreshDailyStats]);
 
   useEffect(() => {
     const update = () => {
@@ -826,6 +1202,10 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   const handleToggleArchive = async (chatId: string, currentArchived: boolean) => {
     try {
       await api.toggleArchiveChat(chatId, !currentArchived);
+      if (!currentArchived) {
+        const chat = chatsRef.current.find((c) => c._id === chatId || c.externalChatId === chatId);
+        if (chat) countArchived(chat);
+      }
       setChats((prev) =>
         prev.map((c) =>
           c._id === chatId || c.externalChatId === chatId
@@ -840,9 +1220,13 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     }
   };
 
-  const markChatAsTransferred = useCallback((chatOrId: any) => {
+  const markChatAsTransferred = useCallback((chatOrId: any, options?: { count?: boolean }) => {
     const targetId = typeof chatOrId === 'string' ? chatOrId : (chatOrId?._id || chatOrId?.externalChatId);
     if (!targetId) return;
+    const chatObj = typeof chatOrId === 'object' && chatOrId ? chatOrId : chatsRef.current.find((c) => c._id === targetId || c.externalChatId === targetId);
+    // Historical scans mark chats but must not inflate today's counter.
+    if (chatObj && options?.count !== false) countTransferred(chatObj);
+    markTransferredSticky(targetId);
     setChats((prev) =>
       prev.map((c) =>
         c._id === targetId || c.externalChatId === targetId
@@ -851,7 +1235,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       )
     );
     api.markChatTransferred(String(targetId), true).catch(() => {});
-  }, []);
+  }, [countTransferred]);
 
   const startTransferHistoryScan = useCallback(async () => {
     if (transferScan) {
@@ -881,7 +1265,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               const hasLink = await searchChatForTmeLink(cl, peer);
               if (hasLink) {
                 found += 1;
-                markChatAsTransferred(c);
+                markChatAsTransferred(c, { count: false });
               }
             }
           } catch (err: any) {
@@ -925,10 +1309,10 @@ export default function Inbox({ role, onAddTelegram }: Props) {
 
   // Refreshes the chat list. Each account is resolved to its own local MTProto
   // client, so chats always come from the account that actually owns them.
-  const loadChats = useCallback(async (showLoading = false) => {
+  const loadChats = useCallback(async (showLoading = false, force = false) => {
     const now = Date.now();
     if (loadChatsInFlightRef.current) return;
-    if (!showLoading && now - lastLoadChatsAtRef.current < 4000) return;
+    if (!showLoading && !force && now - lastLoadChatsAtRef.current < 4000) return;
     loadChatsInFlightRef.current = true;
     lastLoadChatsAtRef.current = now;
     if (showLoading) setLoadingChats(true);
@@ -939,7 +1323,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         try {
           const accClient = await getLiveClient(acc._id);
           if (accClient && accClient.connected) {
-            const dialogs = await fetchLiveTelegramChats(accClient, acc._id, 30);
+            const dialogs = await fetchLiveTelegramChats(accClient, acc._id, 100);
             return {
               connected: true,
               chats: dialogs.map((d) => ({
@@ -963,17 +1347,26 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       ]);
 
       setConnectedAccounts(liveResults.filter((r) => r.connected).length);
-      const finalChats = mergePendingNewChats(
+      const fetchedChats = mergePendingNewChats(
         mergeLiveAndDbChats(
           liveResults.flatMap((r) => r.chats),
           dbRes.chats || []
         )
       );
-      setChats(finalChats);
+      // Mark everything already in the inbox as known before live events fire.
+      seedKnownClients(fetchedChats);
+      // Avoid wiping a good list on a transient empty/failed fetch.
+      if (fetchedChats.length === 0 && chatsRef.current.length > 0) {
+        fetchRepeatedIds();
+        return;
+      }
+      const pendingKeys = new Set(pendingNewChats.current.keys());
+      setChats((prev) => mergeChatLists(prev, fetchedChats, selectedChatIdRef.current, pendingKeys));
       setSelectedChatId((curr) => {
-        if (curr && finalChats.some((c) => c._id === curr || c.externalChatId === curr)) return curr;
+        if (curr && (fetchedChats.some((c) => c._id === curr || c.externalChatId === curr) || chatsRef.current.some((c) => c._id === curr || c.externalChatId === curr))) return curr;
         if (isNarrowViewport()) return null;
-        return finalChats.length > 0 ? finalChats[0]._id || finalChats[0].externalChatId : null;
+        const best = fetchedChats[0] || chatsRef.current[0];
+        return best ? best._id || best.externalChatId : null;
       });
       // Refresh server-authoritative repeated-IDs after chats load
       fetchRepeatedIds();
@@ -1022,7 +1415,12 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       if (role === 'owner') {
         api
           .listChats({ scope, includeArchived: true })
-          .then((res) => setChats(res.chats || []))
+          .then((res) => {
+            const fetched = mergePendingNewChats(res.chats || []);
+            seedKnownClients(fetched);
+            const pendingKeys = new Set(pendingNewChats.current.keys());
+            setChats((prev) => mergeChatLists(prev, fetched, selectedChatIdRef.current, pendingKeys));
+          })
           .catch(() => {});
       }
     }, 30_000);
@@ -1036,6 +1434,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       ]);
       if (isCancelled) return;
       if (cachedChats.length > 0) {
+        seedKnownClients(cachedChats);
         setChats((prev) => (prev.length > 0 ? prev : mergePendingNewChats(cachedChats)));
         setSelectedChatId((curr) => {
           if (curr) return curr;
@@ -1045,7 +1444,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         setLoadingChats(false);
       }
       if (accounts.length === 0) {
-        setLiveStatus('offline');
+        setLiveStatus(navigator.onLine === false ? 'waiting' : 'offline');
         if (cachedChats.length === 0) setLoadingChats(false);
         return;
       }
@@ -1060,8 +1459,10 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         if (isCancelled) return;
         const dbChats: any[] = dbRes.chats || [];
         if (dbChats.length > 0) {
+          seedKnownClients(dbChats);
           const initialChats = mergePendingNewChats(dbChats);
-          setChats(initialChats);
+          const pendingKeys = new Set(pendingNewChats.current.keys());
+          setChats((prev) => mergeChatLists(prev, initialChats, selectedChatIdRef.current, pendingKeys));
           setSelectedChatId((curr) => {
             if (curr && initialChats.some((c: any) => c._id === curr || c.externalChatId === curr)) return curr;
             if (isNarrowViewport()) return null;
@@ -1077,8 +1478,9 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           const values = [...statuses.values()];
           setConnectedAccounts(values.filter((s) => s === 'live').length);
           if (values.includes('live')) setLiveStatus('live');
+          else if (values.includes('waiting')) setLiveStatus('waiting');
           else if (values.includes('connecting')) setLiveStatus('connecting');
-          else setLiveStatus('offline');
+          else setLiveStatus(navigator.onLine === false ? 'waiting' : 'connecting');
         };
 
         const accumulatedLive: any[] = [];
@@ -1097,7 +1499,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             if (cl && cl.connected) {
               statuses.set(accountId, 'live');
               publishStatus();
-              dialogs = await fetchLiveTelegramChats(cl, acc._id, 30);
+              dialogs = await fetchLiveTelegramChats(cl, acc._id, 100);
               const accountChats = dialogs.map((d) => ({
                 ...d,
                 telegramAccountId: acc._id,
@@ -1106,7 +1508,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               accumulatedLive.push(...accountChats);
               if (!isCancelled) {
                 const merged = mergePendingNewChats(mergeLiveAndDbChats(accumulatedLive, dbChats));
-                setChats(merged);
+                const pendingKeys = new Set(pendingNewChats.current.keys());
+                setChats((prev) => mergeChatLists(prev, merged, selectedChatIdRef.current, pendingKeys));
                 setLoadingChats(false);
                 setSelectedChatId((curr) => {
                   if (curr && merged.some((c) => c._id === curr || c.externalChatId === curr)) return curr;
@@ -1115,11 +1518,11 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                 });
               }
             } else {
-              statuses.set(accountId, 'offline');
+              statuses.set(accountId, navigator.onLine === false ? 'waiting' : 'connecting');
               publishStatus();
             }
           } catch (err) {
-            statuses.set(accountId, 'offline');
+            statuses.set(accountId, navigator.onLine === false ? 'waiting' : 'connecting');
             publishStatus();
             console.warn(`[Inbox] Live fetch note for account ${acc._id}:`, err);
           }
@@ -1162,6 +1565,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                 // hidden to the tray).
                 if (!isOut) {
                   const windowFocused = windowFocusedRef.current;
+                  countNewClient(target);
                   if (!isOpen || !windowFocused) {
                     const chatName = getChatDisplayName(target);
                     notifyNewMessage({
@@ -1183,14 +1587,21 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                   });
                   if (idx < 0) return prev;
                   const current = prev[idx];
-                  const isTrans = Boolean(current.isTransferred || containsTmeLink(text));
+                  const isTrans = Boolean(
+                    current.isTransferred ||
+                      containsTmeLink(text) ||
+                      isEverTransferred(current._id) ||
+                      isEverTransferred(current.externalChatId)
+                  );
                   if (isTrans && !current.isTransferred && current._id) {
+                    markTransferredSticky(current._id);
                     api.markChatTransferred(current._id, true).catch(() => {});
                   }
                   const updated = {
                     ...current,
                     lastMessagePreview: text,
                     lastMessageAt: sentAt,
+                    lastMessageDirection: isOut ? 'out' : 'in',
                     isTransferred: isTrans,
                     unreadCount: isOut || isOpen ? 0 : (current.unreadCount || 0) + 1,
                   };
@@ -1213,6 +1624,9 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                     ? await buildLiveChatFromPeer(liveClient, accountId, peer, msg)
                     : null;
                   if (newChat) {
+                    if (!isOut) {
+                      countNewClient(newChat);
+                    }
                     pendingNewChats.current.set(`${accountId}_${newChat.externalChatId}`, {
                       chat: newChat,
                       at: Date.now(),
@@ -1234,7 +1648,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                   console.warn('[Inbox] Could not load new chat:', err);
                 } finally {
                   // Always reconcile with the dialog list for authoritative ids.
-                  loadChats(false);
+                  loadChats(false, true);
                   setTimeout(() => unknownChatFetches.current.delete(fetchKey), 15_000);
                 }
               })();
@@ -1252,7 +1666,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               },
               onReconnect: () => {
                 // Catch up on anything missed while the socket was down.
-                loadChats(false);
+                loadChats(false, true);
               },
               onReadHistory: (peerIds, stillUnreadCount) => {
                 setChats((prev) => {
@@ -1372,7 +1786,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         // ΓöÇΓöÇ END BULK STARTUP SYNC ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
         const finalChats = mergePendingNewChats(mergeLiveAndDbChats(liveChats, dbChats));
-        setChats(finalChats);
+        const pendingKeys = new Set(pendingNewChats.current.keys());
+        setChats((prev) => mergeChatLists(prev, finalChats, selectedChatIdRef.current, pendingKeys));
         setSelectedChatId((curr) => {
           if (curr && finalChats.some((c) => c._id === curr || c.externalChatId === curr)) return curr;
           if (isNarrowViewport()) return null;
@@ -1381,7 +1796,12 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       } catch (err) {
         console.warn('[Inbox] Real-time setup note:', err);
         const res = await api.listChats({ scope, includeArchived: true }).catch(() => ({ chats: [] }));
-        if (!isCancelled) setChats(res.chats || []);
+        if (!isCancelled) {
+          const fetched = mergePendingNewChats(res.chats || []);
+          seedKnownClients(fetched);
+          const pendingKeys = new Set(pendingNewChats.current.keys());
+          setChats((prev) => mergeChatLists(prev, fetched, selectedChatIdRef.current, pendingKeys));
+        }
       } finally {
         if (!isCancelled) setLoadingChats(false);
       }
@@ -1444,7 +1864,9 @@ export default function Inbox({ role, onAddTelegram }: Props) {
 
       // Transferred: chats containing a t.me/ link
       if (filter === 'transferred') {
-        if (!c.isTransferred && !containsTmeLink(c.lastMessagePreview)) return false;
+        const sticky =
+          isEverTransferred(c._id) || isEverTransferred(c.externalChatId);
+        if (!c.isTransferred && !containsTmeLink(c.lastMessagePreview) && !sticky) return false;
       }
 
       // Mine: show only chats belonging to my telegram accounts
@@ -1520,6 +1942,10 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     setChats((prev) =>
       prev.map((c) => (c._id === id || c.externalChatId === id ? { ...c, unreadCount: 0 } : c))
     );
+    const target = chatsRef.current.find((c) => c._id === id || c.externalChatId === id);
+    if (target?._id) {
+      api.markChatRead(target._id).catch(() => {});
+    }
   }, []);
 
   // Load templates
@@ -1534,21 +1960,89 @@ export default function Inbox({ role, onAddTelegram }: Props) {
 
   async function handleCreateTemplate(e: React.FormEvent) {
     e.preventDefault();
-    if (!newTemplateTitle.trim() || !newTemplateBody.trim()) return;
+    const title = newTemplateTitle.trim();
+    const body = newTemplateBody.trim();
+    if (!title || (!body && newTemplateFiles.length === 0)) return;
+    setCreatingTemplate(true);
     try {
-      const res = await api.createTemplate(newTemplateTitle.trim(), newTemplateBody.trim());
+      const bytesToBase64 = (bytes: any) => {
+        if (!bytes) return undefined;
+        const arr = bytes instanceof Uint8Array ? bytes : Array.isArray(bytes) ? new Uint8Array(bytes) : bytes?.data ? new Uint8Array(bytes.data) : null;
+        if (!arr) return undefined;
+        let bin = '';
+        for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+        return btoa(bin);
+      };
+      const toDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
+        reader.readAsDataURL(file);
+      });
+
+      const media: any[] = [];
+      let savedMessageIds: number[] = [];
+      if (newTemplateFiles.length > 0) {
+        const accountId = String(telegramAccounts?.[0]?._id || telegramAccounts?.[0]?.id || '');
+        const client = accountId ? await getActiveTelegramClient(accountId) : null;
+        if (!client || !client.connected) {
+          throw new Error('Connect a Telegram account to upload template media');
+        }
+
+        const files = newTemplateFiles.slice(0, 10);
+        const sentMsgs = await sendTelegramFilesRaw(client, 'me', files, { caption: body || undefined, forceDocument: false });
+        for (let i = 0; i < files.length; i++) {
+          const m = sentMsgs[i] || sentMsgs[0];
+          const photo = m?.photo || m?.media?.photo;
+          const doc = m?.document || m?.media?.document;
+          const dataUrl = await toDataUrl(files[i]).catch(() => undefined);
+          if (photo && (photo.id !== undefined || photo.id !== null)) {
+            media.push({
+              kind: 'photo',
+              id: String(photo.id),
+              accessHash: photo.accessHash !== undefined ? String(photo.accessHash) : undefined,
+              fileReference: bytesToBase64(photo.fileReference),
+              dcId: photo.dcId,
+              mimeType: files[i]?.type || 'image/jpeg',
+              fileName: files[i]?.name,
+              size: files[i]?.size,
+              dataUrl,
+            });
+          } else if (doc && (doc.id !== undefined || doc.id !== null)) {
+            media.push({
+              kind: 'document',
+              id: String(doc.id),
+              accessHash: doc.accessHash !== undefined ? String(doc.accessHash) : undefined,
+              fileReference: bytesToBase64(doc.fileReference),
+              dcId: doc.dcId,
+              mimeType: doc.mimeType || files[i]?.type,
+              fileName: files[i]?.name,
+              size: files[i]?.size,
+              dataUrl,
+            });
+          } else if (dataUrl) {
+            media.push({ kind: 'photo', dataUrl, mimeType: files[i]?.type, fileName: files[i]?.name, size: files[i]?.size });
+          }
+        }
+        savedMessageIds = sentMsgs.map((m: any) => Number(m?.id)).filter((n: number) => Number.isFinite(n) && n > 0);
+      }
+
+      const res = await api.createTemplate({ title, body, media, savedMessageIds });
       setTemplates((prev) => [res.template, ...prev]);
       setNewTemplateTitle('');
       setNewTemplateBody('');
+      setNewTemplateFiles([]);
       setShowCreateTemplate(false);
-      notify('Quick reply saved', 'success');
+      notify('Template created!', 'success');
     } catch (err: any) {
       notify(err.message || 'Failed to create template');
+    } finally {
+      setCreatingTemplate(false);
     }
   }
 
   return (
-    <div className={`inbox-container ${selectedChatId ? 'has-active-chat' : ''}`}>
+    <div className={`inbox-container ${selectedChatId ? 'has-active-chat' : ''} ${dailyStatsOpen ? 'has-daily-stats' : ''}`}>
       {/* Telegram Slide-out Navigation Drawer */}
       {drawerOpen && (
         <div className="tg-drawer-backdrop" onClick={() => setDrawerOpen(false)} />
@@ -1674,6 +2168,23 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               </p>
             </div>
 
+            <div className="tg-drawer-section">
+              <div className="tg-drawer-section-title">
+                <span>Daily stats panel</span>
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+                <span>Show right-side daily counters</span>
+                <input
+                  type="checkbox"
+                  checked={dailyStatsOpen}
+                  onChange={() => toggleDailyStats()}
+                />
+              </label>
+              <p style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                Counts new clients, archived new clients, and transferred clients for today.
+              </p>
+            </div>
+
             {onAddTelegram && (
               <button
                 className="secondary-btn small-btn full-width drawer-add-account"
@@ -1688,21 +2199,25 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             <div className="tg-drawer-section-title">
               <span>Telegram connection</span>
             </div>
-            <div className={`tg-drawer-status-card ${liveStatus === 'live' ? '' : 'is-offline'}`}>
+            <div className={`tg-drawer-status-card ${displayLiveStatus === 'live' ? '' : displayLiveStatus === 'waiting' ? 'is-waiting' : 'is-offline'}`}>
               <div className="tg-drawer-status-row">
-                <span className={liveStatus === 'live' ? 'live-pulse-dot' : 'offline-dot'} />
+                <span className={displayLiveStatus === 'live' ? 'live-pulse-dot' : displayLiveStatus === 'waiting' ? 'waiting-dot' : 'offline-dot'} />
                 <span className="tg-drawer-status-label">
-                  {liveStatus === 'live'
+                  {displayLiveStatus === 'live'
                     ? `Live ┬╖ ${connectedAccounts} account${connectedAccounts === 1 ? '' : 's'} connected`
-                    : liveStatus === 'connecting'
+                    : displayLiveStatus === 'waiting'
+                    ? 'Waiting for networkΓÇª'
+                    : displayLiveStatus === 'connecting'
                     ? 'ReconnectingΓÇª'
                     : 'Not connected'}
                 </span>
               </div>
               <p>
-                {liveStatus === 'live'
+                {displayLiveStatus === 'live'
                   ? 'Messages update live from your linked Telegram accounts. No manual syncing needed.'
-                  : liveStatus === 'connecting'
+                  : displayLiveStatus === 'waiting'
+                  ? 'No network connection. Telegram will reconnect automatically when your connection returns.'
+                  : displayLiveStatus === 'connecting'
                   ? 'Restoring the Telegram live connection automaticallyΓÇª'
                   : 'Link a Telegram account to send and receive messages live. Until then you are viewing saved history.'}
               </p>
@@ -1769,18 +2284,20 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               {filteredChats.length} {filteredChats.length === 1 ? 'chat' : 'chats'}
             </span>
             <div
-              className={`live-status-pill ${liveStatus === 'live' ? '' : 'offline'}`}
+              className={`live-status-pill ${displayLiveStatus === 'live' ? '' : displayLiveStatus === 'waiting' ? 'waiting' : 'offline'}`}
               title={
-                liveStatus === 'live'
+                displayLiveStatus === 'live'
                   ? 'Live Telegram connection active'
-                  : liveStatus === 'connecting'
+                  : displayLiveStatus === 'waiting'
+                  ? 'Waiting for networkΓÇö will reconnect automatically'
+                  : displayLiveStatus === 'connecting'
                   ? 'Reconnecting to TelegramΓÇª'
                   : 'Telegram connection offline ΓÇö retrying automatically'
               }
             >
-              <span className={liveStatus === 'live' ? 'live-pulse-dot' : 'offline-dot'} />
+              <span className={displayLiveStatus === 'live' ? 'live-pulse-dot' : displayLiveStatus === 'waiting' ? 'waiting-dot' : 'offline-dot'} />
               <span>
-                {liveStatus === 'live' ? 'Live' : liveStatus === 'connecting' ? 'Connecting' : 'Offline'}
+                {displayLiveStatus === 'live' ? 'Live' : displayLiveStatus === 'waiting' ? 'Waiting' : displayLiveStatus === 'connecting' ? 'Connecting' : 'Offline'}
               </span>
             </div>
           </div>
@@ -1965,10 +2482,35 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             showTemplates={showTemplates}
             setShowTemplates={setShowTemplates}
             setShowCreateTemplate={setShowCreateTemplate}
+            onDeleteTemplate={async (id) => {
+              try {
+                await api.deleteTemplate(id);
+                setTemplates((prev) => prev.filter((t) => t._id !== id));
+              } catch (err: any) {
+                notify(err?.message || 'Failed to delete template');
+              }
+            }}
+            onDeleteAllTemplates={async () => {
+              if (!templates.length) return;
+              if (!window.confirm('Delete all templates?')) return;
+              try {
+                await Promise.all(templates.map((t) => api.deleteTemplate(t._id)));
+                setTemplates([]);
+              } catch (err: any) {
+                notify(err?.message || 'Failed to delete templates');
+              }
+            }}
             toggleNotes={() => setShowNotes(!showNotes)}
             onToggleArchive={() => handleToggleArchive(selectedChat._id, Boolean(selectedChat.isArchived))}
             onChatTransferred={() => markChatAsTransferred(selectedChat)}
-            onMessageSent={() => loadChats(false)}
+            onMessageSent={(preview, direction, at) => {
+              if (preview) {
+                setChats((prev) => prev.map((c) => (c._id === selectedChat._id || c.externalChatId === selectedChat.externalChatId)
+                  ? { ...c, lastMessagePreview: preview, lastMessageDirection: direction || c.lastMessageDirection, lastMessageAt: at || c.lastMessageAt }
+                  : c));
+              }
+              loadChats(false, true);
+            }}
             notify={notify}
             onBack={() => setSelectedChatId(null)}
           />
@@ -2028,33 +2570,111 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               <label>
                 Template Title
                 <input
-                  placeholder="e.g. Schedule Showing"
+                  placeholder="e.g. Property photos"
                   value={newTemplateTitle}
                   onChange={(e) => setNewTemplateTitle(e.target.value)}
                   required
                 />
               </label>
               <label>
-                Message Body
+                Caption / Message
                 <textarea
-                  rows={4}
-                  placeholder="Hi! Would you like to tour the property this weekend?"
+                  rows={3}
+                  placeholder="Optional caption..."
                   value={newTemplateBody}
                   onChange={(e) => setNewTemplateBody(e.target.value)}
-                  required
+                  required={newTemplateFiles.length === 0}
                 />
               </label>
+              <label>
+                Group Photos (optional)
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={(e) => {
+                    const files = Array.from(e.target.files || []).slice(0, 10);
+                    setNewTemplateFiles(files);
+                  }}
+                />
+              </label>
+              {newTemplateFiles.length > 0 && (
+                <div className="template-media-preview">
+                  {newTemplateFiles.map((f, i) => (
+                    <div key={`${f.name}-${i}`} className="template-media-chip">
+                      <span>{f.name}</span>
+                      <button type="button" onClick={() => setNewTemplateFiles((prev) => prev.filter((_, idx) => idx !== i))}>×</button>
+                    </div>
+                  ))}
+                  <div className="template-media-hint">Images will be uploaded to Telegram Saved Messages and stored for one-click send.</div>
+                </div>
+              )}
               <div className="button-group">
-                <button type="submit" className="primary-btn">
-                  Save Template
+                <button type="submit" className="primary-btn" disabled={creatingTemplate}>
+                  {creatingTemplate ? 'Saving…' : 'Save Template'}
                 </button>
-                <button type="button" className="secondary-btn" onClick={() => setShowCreateTemplate(false)}>
+                <button type="button" className="secondary-btn" onClick={() => { setShowCreateTemplate(false); setNewTemplateFiles([]); }} disabled={creatingTemplate}>
                   Cancel
                 </button>
               </div>
             </form>
           </div>
         </div>
+      )}
+
+      {dailyStatsOpen && (
+        <aside className="daily-stats-panel" aria-label="Daily stats">
+          <div className="daily-stats-header">
+            <strong>Today</strong>
+            <div className="daily-stats-header-actions">
+              <button
+                type="button"
+                className="icon-btn daily-stats-refresh"
+                onClick={() => { refreshDailyStats(); }}
+                title="Refresh counters"
+                aria-label="Refresh counters"
+              >
+                ↻
+              </button>
+              <button
+                type="button"
+                className="icon-btn daily-stats-refresh"
+                onClick={resetDailyStats}
+                title="Reset today's counters"
+                aria-label="Reset today's counters"
+              >
+                ⟲
+              </button>
+            </div>
+          </div>
+          <div className="daily-stats-grid">
+            {([
+              { key: 'incoming', label: 'New clients', stat: dailyStats.incoming },
+              { key: 'archived', label: 'Archived', stat: dailyStats.archived },
+              { key: 'transferred', label: 'Transferred', stat: dailyStats.transferred },
+            ] as const).map(({ key, label, stat }) => (
+              <div key={key} className="daily-stat-card">
+                <div className="daily-stat-value-wrap" tabIndex={0} aria-label={`${label}: ${stat.count}`}>
+                  <span className="daily-stats-value">{stat.count}</span>
+                  <div className="daily-stat-tooltip" role="tooltip">
+                    <div className="daily-stat-tooltip-title">{label} today</div>
+                    {stat.names.length > 0 ? (
+                      <ul className="daily-stat-tooltip-list">
+                        {stat.names.map((name, i) => (
+                          <li key={`${name}-${i}`} title={name}>{name}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="daily-stat-tooltip-empty">No clients recorded yet</div>
+                    )}
+                  </div>
+                </div>
+                <span className="daily-stats-label">{label}</span>
+              </div>
+            ))}
+          </div>
+          <p className="daily-stats-note">Resets at midnight</p>
+        </aside>
       )}
 
       {toast && (
@@ -2083,6 +2703,8 @@ function ChatThread({
   showTemplates,
   setShowTemplates,
   setShowCreateTemplate,
+  onDeleteTemplate,
+  onDeleteAllTemplates,
   toggleNotes,
   onToggleArchive,
   onChatTransferred,
@@ -2100,10 +2722,12 @@ function ChatThread({
   showTemplates: boolean;
   setShowTemplates: (val: boolean) => void;
   setShowCreateTemplate: (val: boolean) => void;
+  onDeleteTemplate: (id: string) => Promise<void> | void;
+  onDeleteAllTemplates: () => Promise<void> | void;
   toggleNotes: () => void;
   onToggleArchive: () => void;
   onChatTransferred: () => void;
-  onMessageSent: () => void;
+  onMessageSent: (preview?: string, direction?: 'in' | 'out', at?: string) => void;
   notify: (message: string, kind?: 'error' | 'success') => void;
   onBack: () => void;
 }) {
@@ -2147,7 +2771,22 @@ function ChatThread({
   const [oldestId, setOldestId] = useState<number | undefined>(() => cachedThread?.oldestId);
   const [draft, setDraftState] = useState(() => draftStore.get(draftKey)?.text ?? '');
   const [sending, setSending] = useState(false);
-  const [previewMedia, setPreviewMedia] = useState<string | null>(null);
+  const [previewMedia, setPreviewMedia] = useState<{ url: string; items: string[]; index: number } | null>(null);
+  const [replyingTo, setReplyingTo] = useState<any | null>(null);
+  useEffect(() => {
+    if (!previewMedia) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPreviewMedia(null);
+      if (e.key === 'ArrowRight' && previewMedia.items.length > 1) {
+        setPreviewMedia((p) => p ? ({ ...p, index: (p.index + 1) % p.items.length, url: p.items[(p.index + 1) % p.items.length] }) : p);
+      }
+      if (e.key === 'ArrowLeft' && previewMedia.items.length > 1) {
+        setPreviewMedia((p) => p ? ({ ...p, index: (p.index - 1 + p.items.length) % p.items.length, url: p.items[(p.index - 1 + p.items.length) % p.items.length] }) : p);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [previewMedia]);
   const [attachments, setAttachmentsState] = useState<DraftAttachment[]>(
     () => {
       const entry = draftStore.get(draftKey) as any;
@@ -2173,7 +2812,7 @@ function ChatThread({
   const [renderStart, setRenderStart] = useState(0);
 
   // Reset the window when the thread is replaced (new chat / fresh fetch).
-  useEffect(() => {
+  useLayoutEffect(() => {
     const len = groupedItems.length;
     if (len === 0) {
       setRenderStart(0);
@@ -2242,6 +2881,40 @@ function ChatThread({
   const topSentinelRef = useRef<HTMLDivElement>(null);
   const shouldScrollToBottomRef = useRef(true);
   const initialScrollDoneRef = useRef(false);
+
+  const jumpToMessage = async (targetIdRaw: string | number) => {
+    const targetId = String(targetIdRaw);
+    const findIndex = () =>
+      groupedItems.findIndex((e) => {
+        const first = e.kind === 'album' ? e.items[0] : e.msg;
+        return String(first.telegramMessageId || first._id || '') === targetId;
+      });
+
+    let idx = findIndex();
+    let tries = 0;
+    while (idx < 0 && hasMore && tries < 6) {
+      await loadOlderMessagesRef.current();
+      await new Promise((r) => setTimeout(r, 120));
+      idx = findIndex();
+      tries += 1;
+    }
+    if (idx >= 0 && idx < renderStart) {
+      setRenderStart(Math.max(0, idx - 5));
+    }
+    let attempts = 0;
+    const attempt = () => {
+      const el = messagesAreaRef.current?.querySelector(`[data-msg-id="${targetId}"]`) as HTMLElement | null;
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('is-reply-highlight');
+        setTimeout(() => el.classList.remove('is-reply-highlight'), 1400);
+      } else if (attempts < 30) {
+        attempts += 1;
+        requestAnimationFrame(attempt);
+      }
+    };
+    requestAnimationFrame(() => requestAnimationFrame(attempt));
+  };
 
   // Each conversation must be read/sent through the MTProto client that owns it.
   const chatAccountId = String(chat.telegramAccountId?._id || chat.telegramAccountId || '');
@@ -2351,7 +3024,7 @@ function ChatThread({
     chatClient.markAsRead(entity).catch(() => {});
   }, [chatClient, messages.length, chat.inputEntity, chat.entity]);
 
-  const fetchMessages = async (isInitial = false) => {
+  const fetchMessages = async (isInitial = false, merge = false) => {
     try {
       const hasCached = Boolean(threadMessageCache.get(cacheKey)?.messages?.length);
       if (isInitial && !hasCached) {
@@ -2411,8 +3084,26 @@ function ChatThread({
       }
 
       if (msgs.length > 0 || !resolvingClient) {
-        setMessages(msgs);
-        if (!chat.isArchived && !chat.isTransferred && msgs.some((m) => containsTmeLink(m.text))) {
+        if (merge && msgs.length > 0) {
+          setMessages((prev) => {
+            const ids = new Set(prev.map((m: any) => String(m.telegramMessageId || m._id)));
+            const merged = [...prev];
+            for (const m of msgs) {
+              const id = String(m.telegramMessageId || m._id);
+              if (!ids.has(id)) { merged.push(m); ids.add(id); }
+            }
+            merged.sort((a: any, b: any) => {
+              const ta = new Date(a.sentAt || 0).getTime();
+              const tb = new Date(b.sentAt || 0).getTime();
+              if (ta !== tb) return ta - tb;
+              return String(a.telegramMessageId || a._id).localeCompare(String(b.telegramMessageId || b._id));
+            });
+            return merged;
+          });
+        } else {
+          setMessages(msgs);
+        }
+        if (!chat.isArchived && !chat.isTransferred && !isEverTransferred(chat._id) && !isEverTransferred(chat.externalChatId) && msgs.some((m) => containsTmeLink(m.text))) {
           onChatTransferred();
         }
         if (msgs.length > 0) {
@@ -2486,7 +3177,7 @@ function ChatThread({
             const newUnique = olderMessages.filter((m) => !existingIds.has(m.telegramMessageId || m._id));
             return [...newUnique, ...prev];
           });
-          if (!chat.isArchived && !chat.isTransferred && olderMessages.some((m) => containsTmeLink(m.text))) {
+          if (!chat.isArchived && !chat.isTransferred && !isEverTransferred(chat._id) && !isEverTransferred(chat.externalChatId) && olderMessages.some((m) => containsTmeLink(m.text))) {
             onChatTransferred();
           }
           setHasMore(res.hasMore);
@@ -2572,7 +3263,7 @@ function ChatThread({
             const newUnique = olderMessages.filter((m) => !existingIds.has(m.telegramMessageId || m._id));
             return [...newUnique, ...prev];
           });
-          if (!chat.isArchived && !chat.isTransferred && olderMessages.some((m) => containsTmeLink(m.text))) {
+          if (!chat.isArchived && !chat.isTransferred && !isEverTransferred(chat._id) && !isEverTransferred(chat.externalChatId) && olderMessages.some((m) => containsTmeLink(m.text))) {
             onChatTransferred();
           }
           currentOldestId = res.oldestId;
@@ -2647,8 +3338,9 @@ function ChatThread({
         {
           accountId: chatAccountId,
           onReconnect: () => {
-            // Pull anything that arrived while the socket was down.
-            fetchMessages();
+            // Pull anything that arrived while the socket was down, merging
+            // into the existing history instead of replacing it.
+            fetchMessages(false, true);
           },
         }
       );
@@ -2692,7 +3384,7 @@ function ChatThread({
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }
     }
-  }, [messages.length, loadingMessages]);
+  }, [messages.length, loadingMessages, renderStart]);
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files || []);
@@ -2757,12 +3449,14 @@ function ChatThread({
         }
       }
       const peer = chat.entity || chat.inputEntity || chat.externalChatId;
+      const replyTo = replyingTo?.telegramMessageId ? Number(replyingTo.telegramMessageId) : undefined;
 
       if (chatClient && chatClient.connected && peer && (textToSend || filesToSend.length > 0)) {
         const sent = await sendLiveTelegramMessage(chatClient, peer, {
           text: filesToSend.length > 0 ? undefined : textToSend,
           caption: filesToSend.length > 0 ? textToSend : undefined,
           files: filesToSend.length > 0 ? filesToSend : undefined,
+          replyTo,
         });
         if (!chat.isArchived && containsTmeLink(textToSend)) {
           onChatTransferred();
@@ -2772,6 +3466,7 @@ function ChatThread({
           senderType: outgoingSenderType,
           text: s.text || (idx === 0 ? textToSend : ''),
           mediaRef: filesToSend.length > 0 ? (idx === 0 ? previewUrl : '[Photo]') : s.mediaRef,
+          replyToMsgId: s.replyToMsgId || (replyTo ? String(replyTo) : undefined),
         }));
         setMessages((prev) => {
           const existing = new Set(prev.map((m) => String(m.telegramMessageId)));
@@ -2779,6 +3474,7 @@ function ChatThread({
           return fresh.length ? [...prev, ...fresh] : prev;
         });
         mirrorLiveChatToCRM(chatAccountId, chat, outgoing).catch(() => { });
+        setReplyingTo(null);
       } else if (role === 'owner') {
         const msgId = String(Date.now());
         await api.recordOwnerReply(chat._id, textToSend || (filesToSend.length ? '[Photo]' : ''), msgId, previewUrl);
@@ -2809,7 +3505,9 @@ function ChatThread({
 
       setDraft('');
       setAttachments([]);
-      onMessageSent();
+      setReplyingTo(null);
+      const preview = filesToSend.length > 0 ? (textToSend || '[Photo]') : (textToSend || '');
+      onMessageSent(preview, 'out', new Date().toISOString());
     } catch (err: any) {
       const errMsg = err?.message || String(err);
       if (errMsg.includes('USER_IS_BLOCKED') || errMsg.includes('YOU_BLOCKED_USER')) {
@@ -2820,6 +3518,52 @@ function ChatThread({
       } else {
         notify(err.message || 'Failed to send message');
       }
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function handleSendTemplate(tpl: any) {
+    if (sending) return;
+    const hasMedia = Array.isArray(tpl?.media) && tpl.media.length > 0;
+    const text = String(tpl?.body || '').trim();
+    if (!text && !hasMedia) return;
+
+    if (!hasMedia) {
+      setDraft(text);
+      setShowTemplates(false);
+      return;
+    }
+
+    if (!chatClient || !chatClient.connected) {
+      notify('Telegram is not connected. Reconnect to send media templates.', 'error');
+      return;
+    }
+
+    setSending(true);
+    try {
+      const peer = chat.entity || chat.inputEntity || chat.externalChatId;
+      const replyTo = replyingTo?.telegramMessageId ? Number(replyingTo.telegramMessageId) : undefined;
+      const sent = await sendLiveTelegramTemplate(chatClient, peer, tpl, replyTo);
+      const outgoing: LiveMessage[] = sent.map((s, idx) => ({
+        ...s,
+        senderType: outgoingSenderType,
+        text: s.text || (idx === 0 ? text : ''),
+        mediaRef: hasMedia ? (idx === 0 ? (tpl.media?.[0]?.dataUrl || '[Photo]') : '[Photo]') : s.mediaRef,
+        replyToMsgId: s.replyToMsgId || (replyTo ? String(replyTo) : undefined),
+      }));
+      setMessages((prev) => {
+        const existing = new Set(prev.map((m) => String(m.telegramMessageId)));
+        const fresh = outgoing.filter((m) => !existing.has(String(m.telegramMessageId)));
+        return fresh.length ? [...prev, ...fresh] : prev;
+      });
+      mirrorLiveChatToCRM(chatAccountId, chat, outgoing).catch(() => { });
+      setReplyingTo(null);
+      setShowTemplates(false);
+      onMessageSent(text || '[Photo]', 'out', new Date().toISOString());
+      notify('Template sent', 'success');
+    } catch (err: any) {
+      notify(err?.message || 'Failed to send template', 'error');
     } finally {
       setSending(false);
     }
@@ -2955,7 +3699,22 @@ function ChatThread({
             <button className="media-preview-close" onClick={() => setPreviewMedia(null)} aria-label="Close media preview">
               <CloseIcon size={20} />
             </button>
-            <img src={previewMedia} alt="Preview" decoding="async" className="media-preview-img-full" />
+            {previewMedia.items.length > 1 && (
+              <>
+                <button
+                  className="media-preview-nav prev"
+                  onClick={() => setPreviewMedia((p) => p && ({ ...p, index: (p.index - 1 + p.items.length) % p.items.length, url: p.items[(p.index - 1 + p.items.length) % p.items.length] }))}
+                  aria-label="Previous image"
+                >‹</button>
+                <button
+                  className="media-preview-nav next"
+                  onClick={() => setPreviewMedia((p) => p && ({ ...p, index: (p.index + 1) % p.items.length, url: p.items[(p.index + 1) % p.items.length] }))}
+                  aria-label="Next image"
+                >›</button>
+                <div className="media-preview-count">{previewMedia.index + 1} / {previewMedia.items.length}</div>
+              </>
+            )}
+            <img src={previewMedia.url} alt="Preview" decoding="async" className="media-preview-img-full" />
           </div>
         </div>
       )}
@@ -3047,29 +3806,7 @@ function ChatThread({
                 className="bubble-reply-quote"
                 role="button"
                 tabIndex={0}
-                onClick={() => {
-                  const targetId = String(msg.replyToMsgId);
-                  const targetIndex = groupedItems.findIndex((e) => {
-                    const first = e.kind === 'album' ? e.items[0] : e.msg;
-                    return String(first.telegramMessageId || first._id || '') === targetId;
-                  });
-                  if (targetIndex >= 0 && targetIndex < renderStart) {
-                    setRenderStart(Math.max(0, targetIndex - 5));
-                  }
-                  const attempt = () => {
-                    const el = messagesAreaRef.current?.querySelector(
-                      `[data-msg-id="${msg.replyToMsgId}"]`
-                    ) as HTMLElement | null;
-                    if (el) {
-                      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                      el.classList.add('is-reply-highlight');
-                      setTimeout(() => el.classList.remove('is-reply-highlight'), 1400);
-                    } else {
-                      requestAnimationFrame(attempt);
-                    }
-                  };
-                  requestAnimationFrame(() => requestAnimationFrame(attempt));
-                }}
+                onClick={() => { void jumpToMessage(String(msg.replyToMsgId)); }}
               >
                 <span className="bubble-reply-sender">{senderLabel}</span>
                 <span className="bubble-reply-snippet">{snippet}</span>
@@ -3118,7 +3855,11 @@ function ChatThread({
                         <div
                           key={item._id || item.telegramMessageId || idx}
                           className="bubble-media-grid-item"
-                          onClick={() => setPreviewMedia(item.mediaRef)}
+                          onClick={() => {
+                            const items = entry.items.map((x: any) => x.mediaRef).filter(Boolean);
+                            const index = Math.max(0, items.indexOf(item.mediaRef));
+                            setPreviewMedia({ url: item.mediaRef, items, index });
+                          }}
                         >
                           <img
                             src={item.mediaRef}
@@ -3148,6 +3889,7 @@ function ChatThread({
                     </>
                   )}
                   <div className="bubble-footer">
+                    <button type="button" className="bubble-action-btn" onClick={() => setReplyingTo(first)} title="Reply">Reply</button>
                     <span className="msg-time">
                       {new Date(last.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </span>
@@ -3166,7 +3908,7 @@ function ChatThread({
               >
                 {renderReplyQuote(m)}
                 {m.mediaRef ? (
-                  <div className="bubble-media-wrapper" onClick={() => setPreviewMedia(m.mediaRef)}>
+                  <div className="bubble-media-wrapper" onClick={() => setPreviewMedia({ url: m.mediaRef, items: [m.mediaRef], index: 0 })}>
                     <img
                       src={m.mediaRef}
                       alt="Photo"
@@ -3191,6 +3933,7 @@ function ChatThread({
                 )}
                 {renderTranslation(m)}
                 <div className="bubble-footer">
+                  <button type="button" className="bubble-action-btn" onClick={() => setReplyingTo(m)} title="Reply">Reply</button>
                   <span className="msg-time">
                     {new Date(m.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </span>
@@ -3206,6 +3949,19 @@ function ChatThread({
       </div>
 
       <div className="composer-wrapper">
+        {replyingTo && (
+          <div className="composer-reply-bar">
+            <div className="composer-reply-info">
+              <span className="composer-reply-title">Replying to {replyingTo.direction === 'out' ? 'You' : getChatDisplayName(chat)}</span>
+              <span className="composer-reply-snippet">
+                {replyingTo.text && !String(replyingTo.text).startsWith('[') ? replyingTo.text : (replyingTo.mediaRef ? 'Photo' : 'Message')}
+              </span>
+            </div>
+            <button type="button" className="composer-reply-cancel" onClick={() => setReplyingTo(null)} title="Cancel reply">
+              <CloseIcon size={14} />
+            </button>
+          </div>
+        )}
         {attachments.length > 0 && (
           <div className="composer-attachment-preview" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             {attachments.map((att, idx) => (
@@ -3234,34 +3990,52 @@ function ChatThread({
           <div className="templates-popup">
             <div className="templates-popup-header">
               <span>Quick Replies</span>
-              <button
-                type="button"
-                className="text-btn"
-                onClick={() => {
-                  setShowTemplates(false);
-                  setShowCreateTemplate(true);
-                }}
-              >
-                + New Template
-              </button>
+              <div className="templates-popup-actions">
+                <button
+                  type="button"
+                  className="text-btn"
+                  onClick={() => { void onDeleteAllTemplates(); }}
+                  disabled={templates.length === 0}
+                >
+                  Delete all
+                </button>
+                <button
+                  type="button"
+                  className="text-btn"
+                  onClick={() => {
+                    setShowTemplates(false);
+                    setShowCreateTemplate(true);
+                  }}
+                >
+                  + New
+                </button>
+              </div>
             </div>
             <div className="templates-list">
               {templates.length === 0 ? (
                 <p className="empty-templates-hint">No saved templates yet.</p>
               ) : (
                 templates.map((tpl) => (
-                  <button
-                    key={tpl._id}
-                    type="button"
-                    className="template-item-btn"
-                    onClick={() => {
-                      setDraft(tpl.body);
-                      setShowTemplates(false);
-                    }}
-                  >
-                    <strong>{tpl.title}</strong>
-                    <span>{tpl.body.slice(0, 50)}ΓÇª</span>
-                  </button>
+                  <div key={tpl._id} className="template-item-row">
+                    <button
+                      type="button"
+                      className="template-item-btn"
+                      onClick={() => { void handleSendTemplate(tpl); }}
+                    >
+                      <strong>{tpl.title}</strong>
+                      <span>
+                        {Array.isArray(tpl.media) && tpl.media.length > 0 ? `📷 ${tpl.media.length} photo${tpl.media.length > 1 ? 's' : ''}${tpl.body ? ` · ${tpl.body.slice(0, 40)}` : ''}` : `${(tpl.body || '').slice(0, 50)}…`}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="template-delete-btn"
+                      title="Delete template"
+                      onClick={(e) => { e.stopPropagation(); void onDeleteTemplate(tpl._id); }}
+                    >
+                      ×
+                    </button>
+                  </div>
                 ))
               )}
             </div>

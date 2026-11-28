@@ -1,0 +1,348 @@
+REALTYDESK CRM - HOW THE SYSTEM WORKS
+=====================================
+
+This document describes how the RealtyDesk CRM system works, based on the current
+codebase (client + server).
+
+
+1. HIGH-LEVEL ARCHITECTURE
+--------------------------
+RealtyDesk is a Telegram CRM with two main parts:
+
+- Client (desktop app): Tauri + React + TypeScript + Vite.
+  Location: client/
+  Main UI: client/src/screens/Inbox.tsx
+  Telegram/live logic: client/src/lib/telegram.ts, client/src/lib/telegramLiveService.ts
+  API client: client/src/api/client.ts
+  Local secure storage: client/src/lib/secureStorage.ts
+  Local SQLite cache (Tauri desktop): client/src/lib/localDb.ts
+
+- Server (CRM backend): Node.js + Express + MongoDB/Mongoose.
+  Location: server/
+  Entry/routes: server/src/app.js, server/src/routes/*
+  Sync routes: server/src/routes/sync.js
+  Auth middleware: server/src/middleware/auth.js
+
+The system has two user roles:
+- Agent: manages their own linked Telegram accounts and chats.
+- Owner: can view org-wide chats/agents and manage owner/admin features.
+
+Telegram messaging itself is done directly from the client using GramJS (MTProto).
+The RealtyDesk server stores CRM metadata/content for sync, collaboration, and
+org-wide visibility. Telegram session secrets are not sent to the server.
+
+
+2. SECURITY BOUNDARY (IMPORTANT)
+-------------------------------
+Telegram MTProto session strings and auth tokens are stored locally on the device.
+
+- secureStorage.ts saves Telegram sessions in the OS keychain through Tauri
+  keyring commands (Windows Credential Manager on Windows).
+- In non-Tauri/browser dev preview, it falls back to sessionStorage/memory only
+  (not persisted as secure OS keychain storage).
+- API calls to the RealtyDesk server send metadata/content (chat/contact/message
+  info) but never Telegram session material.
+- After Telegram login/linking, client calls /telegram-accounts to register account
+  metadata only (telegramUserId, displayName, username, phoneMasked).
+
+
+3. AUTHENTICATION FLOW
+----------------------
+Supported login flows (via client/src/api/client.ts):
+
+- Agent activation code redeem: POST /auth/activation-code/redeem
+- Agent login: POST /auth/agent/login
+- Owner login: POST /auth/owner/login
+- Token refresh: POST /auth/refresh
+- Logout: POST /auth/logout
+
+Token handling:
+- Access/refresh tokens are loaded from secure local storage for API requests.
+- request() adds Authorization: Bearer <accessToken>.
+- On 401, client tries tryRefresh() once, saves new access token, retries request.
+- If refresh fails, auth failure handler can trigger app logout/reauth behavior.
+
+
+4. TELEGRAM ACCOUNT LINKING FLOW
+--------------------------------
+The "+ Add Telegram" flow connects a Telegram account using MTProto on the client.
+
+Main implementation: client/src/lib/telegram.ts
+
+Phone/code flow:
+1. requestTelegramPhoneCode(phoneNumber)
+   - Normalizes phone number.
+   - Creates GramJS TelegramClient with API_ID/API_HASH from env.
+   - Connects over WSS and sends auth code (client.sendCode).
+   - Returns client, phoneCodeHash, isCodeViaApp, etc.
+
+2. submitTelegramCode(...)
+   - Invokes Api.auth.SignIn with phoneNumber, phoneCodeHash, phoneCode.
+   - On success, gets user, saves/returns session string.
+   - If SESSION_PASSWORD_NEEDED, reports needsPassword=true.
+
+3. submitTelegram2FAPassword(...)
+   - Gets SRP params via account.GetPassword.
+   - Computes SRP check and invokes auth.CheckPassword.
+   - Returns telegramUserId and sessionString.
+
+QR flow:
+- startTelegramQrLogin(...) uses signInUserWithQrCode.
+- Displays QR token as tg://login URI.
+- Handles optional 2FA password callback.
+
+After successful auth:
+- Session is stored locally by secureStorage (keyed by account id used by app).
+- Account metadata is linked to CRM via api.linkTelegramAccount().
+- The authenticated client can be adopted into the app-wide client cache
+  (adoptTelegramClient) so live updates continue on the same socket.
+
+
+5. TELEGRAM CLIENT CONNECTION MANAGEMENT
+----------------------------------------
+Main implementation: client/src/lib/telegram.ts
+
+Client cache:
+- clientCache: Map<accountId, TelegramClient> keeps one active MTProto client per account.
+- pendingConnections prevents duplicate concurrent connects for same account.
+- adoptTelegramClient() registers an already-authenticated client.
+- destroyTelegramClient() destroys and removes cached client.
+
+Connection activation:
+- activateClient() connects if needed, calls getMe(), and invokes updates.GetState.
+  updates.GetState helps ensure Telegram starts pushing updates to that connection.
+- Timeouts are generous for low networks (connect/getMe/GetState).
+- Auth-dead errors (AUTH_KEY_UNREGISTERED, SESSION_REVOKED, USER_DEACTIVATED, etc.)
+  cause session cleanup. Transient/offline failures do not delete session.
+
+Reconnect:
+- reconnect() loads local session from secureStorage and creates/reuses client.
+- Uses WSS and connection retries.
+- Returns null on transient failure; keeps session for future retry.
+
+Keep-alive:
+- A shared keep-alive timer periodically calls getDialogs({limit:1}) for connected
+  clients to keep update delivery healthy on idle sockets.
+- Runs every 30s while there are cached clients.
+
+
+6. INBOX LOADING AND LOCAL-FIRST BEHAVIOR
+-----------------------------------------
+Main implementation: client/src/screens/Inbox.tsx
+
+Initial paint:
+- Chats state is initialized from localStorage cache (CHAT_CACHE_KEY) for instant UI.
+- On mount, Inbox loads cached chats from SQLite (loadCachedChats) in parallel with
+  account fetch, so offline/relaunch can show previous chats quickly.
+- It then fetches DB chats from CRM server and live dialogs from Telegram.
+
+Account/chat loading:
+- fetchAccounts() loads user's own Telegram accounts and org account directory.
+- loadChats() fetches live dialogs per account via getLiveClient/fetchLiveTelegramChats
+  and DB chats via api.listChats(..., includeArchived:true).
+- Results are merged by mergeLiveAndDbChats() so CRM fields (notes/ids/archive/agent
+  linkage/duplicate flags/transferred state) enrich live Telegram dialogs.
+- mergePendingNewChats() preserves chats inserted by live events before dialog refresh
+  catches up.
+
+Local caches:
+- localStorage: lightweight recent chat cache for synchronous first paint.
+- SQLite (Tauri localDb): durable chat/message cache and FTS5 search index.
+- threadMessageCache (in-memory): keeps opened thread messages for fast chat switching.
+- draftStore (in-memory): preserves unsent drafts per chat when switching threads.
+
+
+7. REAL-TIME UPDATES (LIVE LIKE TELEGRAM)
+-----------------------------------------
+Main implementation: client/src/lib/telegramLiveService.ts + Inbox.tsx
+
+Live subscription:
+- subscribeLiveTelegramUpdates(client, onNewMessage, options) attaches GramJS handlers:
+  - NewMessage handler for incoming/outgoing messages.
+  - Raw handler for UpdateReadHistoryInbox/Outbox.
+- Returns cleanup function that removes handlers/listeners/timers.
+
+Per-account subscription in Inbox:
+- For each linked account, Inbox connects client, loads dialogs, subscribes to updates.
+- On new message:
+  - If chat exists in current list: update preview/time/unread, move chat to top,
+    mirror message to CRM (api.syncMessages), mark read if open, notify if needed.
+  - If chat is unknown/new: build chat from peer, insert immediately, mirror to CRM,
+    refresh repeated IDs, and reconcile dialog list.
+
+Thread subscription (ChatThread):
+- Open conversation subscribes to live updates for that account/chat.
+- Incoming message is appended if not duplicate.
+- Media is downloaded in background and message mediaRef updated.
+- On reconnect catch-up, thread calls fetchMessages(false, true) to merge missed
+  messages into existing history (not replace blindly).
+
+Read state sync:
+- Opening/reading chat marks CRM read (api.markChatRead).
+- Telegram read state is also marked via client.markAsRead when possible.
+- Read-history updates from Telegram update unread counts in UI and CRM.
+
+
+8. NETWORK LOSS / RECONNECT / AUTO-SYNC BEHAVIOR
+------------------------------------------------
+This is the key realtime reliability layer.
+
+telegramLiveService.subscribeLiveTelegramUpdates():
+- Has watchdog timer (default 15s) that checks connection health.
+- If client is connected, it keeps handlers attached and reports live.
+- If disconnected, it enters reconnect flow with exponential backoff.
+  Backoff prevents aggressive retries on low/flaky networks.
+- On successful reconnect: status becomes live and onReconnect callback fires.
+- No false "stale" reconnect based only on quiet chat inactivity; quiet chats are valid.
+
+Event triggers for recovery:
+- window "online": clears backoff, forces ensureLive(), triggers catch-up.
+- document visibilitychange (visible): clears backoff/rechecks and catches up.
+- Inbox also listens for online/visibilitychange and calls loadChats/fetchRepeatedIds.
+
+Catch-up after reconnect:
+- Inbox onReconnect: loadChats(false, true) to reconcile dialogs/unread/previews.
+- ChatThread onReconnect: fetchMessages(false, true) to merge missed messages.
+
+Result:
+- When network drops, status may become connecting/offline depending on retries.
+- When network returns, client retries, resubscribes/reuses handlers, and catches up.
+- Missed chat list/message updates are reconciled through refresh/merge, so UI
+  becomes consistent again automatically.
+
+
+9. CRM SYNC (CLIENT -> SERVER)
+------------------------------
+Main implementation: client/src/lib/telegramLiveService.ts mirrorLiveChatToCRM,
+client/src/api/client.ts, server/src/routes/sync.js
+
+Single chat/message sync:
+- POST /sync/messages
+- Sends telegramAccountId, chatExternalId, contact metadata, isArchived, messages.
+- Server validates account ownership in org, upserts contact, upserts chat, bulk upserts
+  messages by (chatId, telegramMessageId), updates lastMessageAt/preview/unreadCount,
+  detects t.me transfer links, updates account.lastSyncAt.
+
+Batch startup sync:
+- POST /sync/batch-messages
+- Used during initial account sync to push dialog metadata/contact/chat upserts quickly.
+- Startup sync sends messages as empty array for metadata upsert (fast) and avoids
+  risky historical Telegram address-book auto-add behavior.
+
+Read sync:
+- POST /sync/chats/:chatId/read sets unreadCount=0 in CRM DB.
+
+Other chat state sync:
+- PATCH /chats/:id/archive
+- PATCH /chats/:id/block
+- PATCH /chats/:id/transferred
+
+Important server behavior:
+- resolveMessageSender() prevents agents from attributing synced messages as owner.
+- Messages are deduped/upserted by telegramMessageId per chat.
+
+
+10. MESSAGE FETCHING AND SENDING
+--------------------------------
+Fetching messages (live):
+- fetchLiveTelegramMessages(client, peer, {limit, offsetId}, onMediaDownloaded)
+- Uses GramJS client.getMessages.
+- Supports pagination (older messages via offsetId).
+- Downloads media in background with limited concurrency.
+- Returns hasMore/oldestId/total.
+
+Fetching fallback:
+- If live MTProto path unavailable/fails, ChatThread falls back to CRM DB messages
+  via api.chatMessages(chatId, before, limit).
+
+Sending messages:
+- sendLiveTelegramMessage() sends directly through Telegram MTProto.
+- Supports text and files/photos (client.sendFile / sendMessage).
+- UI appends optimistic message, then reconciles with real sent message id.
+- Sent message is mirrored to CRM (sync/messages) so server/owner view stays updated.
+- Outgoing senderType is agent/owner depending on current role and account ownership.
+
+
+11. SEARCH, FILTERS, AND CRM FEATURES
+-------------------------------------
+Inbox supports filters including:
+- all, unread, mine, repeated, transferred, blocked, archived
+
+Search:
+- Local in-memory filtering by name/preview/username/phone.
+- SQLite FTS5 local search (desktop) over cached chats/messages for deeper local search.
+- Server listChats also supports query/scope/includeArchived.
+
+Repeated/duplicate leads:
+- Server endpoint GET /chats/repeated-ids provides authoritative repeated chat IDs
+  and collision map across accounts in org.
+- UI uses serverRepeatedIds/serverCollisionMap for repeated badges/banner.
+
+Transferred chats:
+- Marked when message preview/text contains t.me links, or manually marked.
+- Sticky local tracking is also used for UX continuity; server state is patched.
+
+Notes/templates:
+- Contact notes: GET/POST /contacts/:id/notes
+- Templates/quick replies: GET/POST /templates
+- Owner admin can manage agents/activation codes through /owner/* endpoints.
+
+
+12. LOCAL CACHING / OFFLINE SUPPORT
+-----------------------------------
+Local-first layers:
+
+- localStorage chat cache: quick startup paint before network.
+- SQLite localDb cache (Tauri): durable chats/messages and FTS search.
+- threadMessageCache: fast in-memory thread switching.
+- Draft store: unsent text/attachments preserved when switching chats.
+
+Cache behavior:
+- Chats are periodically written to localStorage and SQLite.
+- Messages are debounced write-through to SQLite.
+- Media data URLs are not stored aggressively in durable cache to avoid huge rows.
+- On relaunch/offline, cached chats/messages can be shown immediately.
+
+
+13. OWNER VS AGENT VISIBILITY
+-----------------------------
+- Agent typically sees their own linked accounts/chats.
+- Owner can access org-wide account/chat visibility (subject to server rules).
+- Server remains source of truth for CRM records; clients sync live Telegram events
+  into CRM so other users/owner views can stay updated.
+- Some owner views are poll-based because deployment environment may not provide
+  long-lived websocket server push; Inbox polls repeated IDs and can refresh chats.
+
+
+14. MAIN FILE MAP
+-----------------
+Client:
+- client/src/screens/Inbox.tsx          - main inbox UI, chat list, thread, realtime wiring
+- client/src/lib/telegram.ts            - MTProto login/connect/reconnect/client cache/keepalive
+- client/src/lib/telegramLiveService.ts  - live dialogs/messages/send/subscribe/reconnect watchdog
+- client/src/api/client.ts               - REST API client, auth refresh, CRM endpoints
+- client/src/lib/secureStorage.ts        - OS keychain/local secure storage for sessions/tokens
+- client/src/lib/localDb.ts              - Tauri SQLite local cache + FTS search
+- client/src/lib/mediaStore.ts           - local media blob/data storage helpers
+- client/src/lib/avatarCache.ts          - avatar caching/downloading
+- client/src/lib/notifications.ts        - desktop notifications
+
+Server:
+- server/src/routes/sync.js              - message/chat sync endpoints
+- server/src/routes/chats.js             - chat listing/filtering/repeated/archive/block/transfer
+- server/src/routes/telegramAccounts.js  - link/list/unlink telegram account metadata
+- server/src/routes/auth.js              - auth/login/redeem/refresh/logout
+- server/src/models/*                    - MongoDB models (Chat, Message, Contact, etc.)
+
+
+15. SIMPLE END-TO-END SUMMARY
+-----------------------------
+1. User logs in (agent/owner).
+2. User links Telegram account via MTProto (phone/QR) on client.
+3. Session stays local in OS keychain; server gets only account metadata.
+4. Client connects GramJS MTProto, loads dialogs, shows inbox.
+5. Client subscribes to live Telegram updates for realtime new messages/read state.
+6. Incoming/outgoing messages update UI instantly and are mirrored to CRM server.
+7. If network drops, watchdog/backoff retries; on reconnect/online/visible, app
+   catches up by refreshing dialogs and merging missed thread messages.
+8. SQLite/localStorage caches keep inbox usable and fast across restarts and poor network.

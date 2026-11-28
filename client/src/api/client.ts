@@ -232,8 +232,10 @@ export const api = {
     request<{ note: any }>(`/contacts/${id}/notes`, { method: 'POST', body: JSON.stringify({ text }) }),
 
   listTemplates: () => request<{ templates: any[] }>('/templates'),
-  createTemplate: (title: string, body: string) =>
-    request<{ template: any }>('/templates', { method: 'POST', body: JSON.stringify({ title, body }) }),
+  createTemplate: (payload: { title: string; body: string; media?: any[]; savedMessageIds?: number[] }) =>
+    request<{ template: any }>('/templates', { method: 'POST', body: JSON.stringify(payload) }),
+  deleteTemplate: (id: string) =>
+    request<{ ok: true }>(`/templates/${id}`, { method: 'DELETE' }),
 
   createActivationCode: (maxUses: number, expiresAt?: string) =>
     request<{ activationCode: any }>('/owner/activation-codes', {

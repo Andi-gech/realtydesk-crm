@@ -548,6 +548,37 @@ fn cache_messages_load_stream(
     Ok(())
 }
 
+fn clamp_window_to_work_area(window: &tauri::WebviewWindow) {
+    let Ok(Some(monitor)) = window.current_monitor() else { return; };
+    let work = monitor.work_area();
+    let Ok(size) = window.outer_size() else { return; };
+    let Ok(pos) = window.outer_position() else { return; };
+
+    let work_x = work.position.x as i64;
+    let work_y = work.position.y as i64;
+    let work_w = work.size.width as i64;
+    let work_h = work.size.height as i64;
+
+    let mut new_w = size.width as i64;
+    let mut new_h = size.height as i64;
+    if new_w > work_w { new_w = work_w; }
+    if new_h > work_h { new_h = work_h; }
+
+    let mut new_x = pos.x as i64;
+    let mut new_y = pos.y as i64;
+    if new_x < work_x { new_x = work_x; }
+    if new_y < work_y { new_y = work_y; }
+    if new_x + new_w > work_x + work_w { new_x = work_x + work_w - new_w; }
+    if new_y + new_h > work_y + work_h { new_y = work_y + work_h - new_h; }
+
+    if (new_w as u32) != size.width || (new_h as u32) != size.height {
+        let _ = window.set_size(tauri::PhysicalSize::new(new_w as u32, new_h as u32));
+    }
+    if (new_x as i32) != pos.x || (new_y as i32) != pos.y {
+        let _ = window.set_position(tauri::PhysicalPosition::new(new_x as i32, new_y as i32));
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -608,6 +639,10 @@ fn main() {
             }
             tray.build(app)?;
 
+            if let Some(window) = app.get_webview_window("main") {
+                clamp_window_to_work_area(&window);
+            }
+
             Ok(())
         })
         // Diagnostic: confirm the webview actually loaded the frontend bundle.
@@ -620,6 +655,15 @@ fn main() {
                 if !QUITTING.load(Ordering::SeqCst) {
                     api.prevent_close();
                     let _ = window.hide();
+                }
+            }
+            if let WindowEvent::Resized(_) = event {
+                let is_maximized = window.is_maximized().unwrap_or(false);
+                let is_fullscreen = window.is_fullscreen().unwrap_or(false);
+                if !is_maximized && !is_fullscreen {
+                    if let Some(w) = window.app_handle().get_webview_window(window.label()) {
+                        clamp_window_to_work_area(&w);
+                    }
                 }
             }
         })
