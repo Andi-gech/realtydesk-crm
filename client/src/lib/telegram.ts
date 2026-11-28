@@ -482,17 +482,19 @@ let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
 function startKeepAlive(): void {
   if (keepAliveTimer) return;
   keepAliveTimer = setInterval(async () => {
-    for (const client of clientCache.values()) {
-      if (!client.connected) continue;
-      try {
-        await Promise.race([
-          client.getDialogs({ limit: 1 }),
-          new Promise((resolve) => setTimeout(resolve, 15000)),
-        ]);
-      } catch {
-        // A failed keep-alive is harmless; the watchdog reconnects if needed.
-      }
-    }
+    await Promise.allSettled(
+      [...clientCache.values()].map(async (client) => {
+        if (!client.connected) return;
+        try {
+          await Promise.race([
+            client.getDialogs({ limit: 1 }),
+            new Promise((resolve) => setTimeout(resolve, 8000)),
+          ]);
+        } catch {
+          // A failed keep-alive is harmless; the watchdog reconnects if needed.
+        }
+      })
+    );
   }, 30_000);
 }
 

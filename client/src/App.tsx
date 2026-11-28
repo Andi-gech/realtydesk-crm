@@ -19,6 +19,44 @@ type View = 'inbox' | 'add_telegram' | 'owner_admin';
 const BOOT_STAGES = ['Reading local keychain', 'Refreshing session', 'Loading workspace'];
 const BOOT_PROGRESS = [0.16, 0.52, 0.86];
 
+/**
+ * Last known session shape. Lets a returning user land straight in the app
+ * while the token refresh and account check finish in the background, instead
+ * of staring at the splash for several seconds.
+ */
+const BOOT_CACHE_KEY = 'rd_boot_cache';
+
+type BootCache = {
+  role: Role;
+  view: View;
+  hasLinkedTelegram: boolean;
+};
+
+function readBootCache(): BootCache | null {
+  try {
+    const raw = localStorage.getItem(BOOT_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && (parsed.role === 'agent' || parsed.role === 'owner')) {
+      return {
+        role: parsed.role,
+        view:
+          parsed.view === 'add_telegram' || parsed.view === 'owner_admin'
+            ? parsed.view
+            : 'inbox',
+        hasLinkedTelegram: Boolean(parsed.hasLinkedTelegram),
+      };
+    }
+  } catch {}
+  return null;
+}
+
+function writeBootCache(cache: BootCache): void {
+  try {
+    localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify(cache));
+  } catch {}
+}
+
 function parseJwtPayload(token: string): any {
   try {
     const parts = token.split('.');
@@ -45,6 +83,7 @@ export default function App() {
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [bootStage, setBootStage] = useState(0);
   const [bootStalled, setBootStalled] = useState(false);
+  const [bootSeconds, setBootSeconds] = useState(0);
   const [pendingUpdate, setPendingUpdate] = useState<any>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -76,6 +115,21 @@ export default function App() {
   }, [theme]);
 
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+
+  // Remember the last known session shape so the next launch can paint the app
+  // immediately instead of waiting on the network.
+  useEffect(() => {
+    if (!role) return;
+    writeBootCache({ role, view: currentView, hasLinkedTelegram });
+  }, [role, currentView, hasLinkedTelegram]);
+
+  // Live elapsed counter on the splash so a slow start never looks frozen.
+  useEffect(() => {
+    if (!checkingAuth) return;
+    setBootSeconds(0);
+    const timer = setInterval(() => setBootSeconds((s) => s + 1), 1000);
+    return () => clearInterval(timer);
+  }, [checkingAuth]);
 
   useEffect(() => {
     // Diagnostic: confirm the frontend reached App and can talk to Rust.
@@ -115,30 +169,47 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  // Auto-restore session on boot with reliable token refresh
+  // Auto-restore session on boot with reliable token refresh.
+  // Fast path: if we have a token + cached role, render the app shell at once
+  // and finish refresh/account checks in the background.
   useEffect(() => {
     let active = true;
 
-    // Honest escape hatch if the network hangs — the bar stops moving, so offer a way out.
+    // Honest escape hatch if the keychain/network hangs — offer a way out.
     const stallTimer = setTimeout(() => {
       if (active) setBootStalled(true);
-    }, 4000);
+    }, 8000);
 
-    // Safety watchdog: ensure splash never hangs indefinitely
+    // Safety watchdog: ensure splash never hangs indefinitely.
     const watchdog = setTimeout(() => {
       if (active) {
         console.warn('[App] Session restoration watchdog fired, proceeding to UI');
         setCheckingAuth(false);
       }
-    }, 6000);
+    }, 20000);
 
     async function initAuth() {
+      let painted = false;
       try {
         const { accessToken: initialAccessToken, refreshToken } = await loadAuthTokens();
         let accessToken = initialAccessToken;
         if (active) setBootStage(1);
 
-        // Auto-refresh access token if expired or about to expire within 30s
+        const cached = readBootCache();
+        const initialPayload = accessToken ? parseJwtPayload(accessToken) : null;
+
+        // Paint immediately from the last known session. The token may still be
+        // valid; if it is not, the background refresh or the auth-failure
+        // handler signs the user out.
+        if (active && cached && initialPayload && initialPayload.role) {
+          setRole(initialPayload.role);
+          setCurrentView(cached.view);
+          setHasLinkedTelegram(cached.hasLinkedTelegram);
+          setCheckingAuth(false);
+          painted = true;
+        }
+
+        // Auto-refresh access token if expired or about to expire within 30s.
         if (refreshToken) {
           let isExpired = true;
           if (accessToken) {
@@ -166,20 +237,20 @@ export default function App() {
               // Owners start in the Inbox and can link an account from there.
               setCurrentView('inbox');
             } else {
-              // Agent / Sub-user: check if they have connected accounts
+              // Agent / Sub-user: check if they have connected accounts.
               try {
                 const accountsRes = await api.myTelegramAccounts();
                 if (active) {
                   if (accountsRes.telegramAccounts && accountsRes.telegramAccounts.length > 0) {
                     setHasLinkedTelegram(true);
                     setCurrentView('inbox');
-                  } else {
+                  } else if (!painted) {
                     setCurrentView('add_telegram');
                   }
                 }
               } catch (err) {
                 console.warn('[App] Accounts fetch non-fatal notice:', err);
-                if (active) setCurrentView('inbox');
+                if (active && !painted) setCurrentView('inbox');
               }
             }
           }
@@ -189,7 +260,7 @@ export default function App() {
       } finally {
         clearTimeout(watchdog);
         clearTimeout(stallTimer);
-        if (active) {
+        if (active && !painted) {
           setCheckingAuth(false);
         }
       }
@@ -244,6 +315,9 @@ export default function App() {
         <div className="boot-copy">
           <div className="boot-wordmark">RealtyDesk</div>
           <p className="boot-stage">{BOOT_STAGES[bootStage]}</p>
+          {bootSeconds >= 2 && (
+            <p className="boot-elapsed">Still connecting… {bootSeconds}s</p>
+          )}
         </div>
         <div className="boot-progress" aria-hidden="true">
           <div

@@ -6,7 +6,7 @@ import BrandMark from '../components/BrandMark';
 import { getCachedAvatar, subscribeAvatarUpdates, bufferToDataUrl } from '../lib/avatarCache';
 import { translateText, getTargetLanguage } from '../lib/translation';
 import { deleteSession, loadSession } from '../lib/secureStorage';
-import { destroyTelegramClient, getActiveTelegramClient } from '../lib/telegram';
+import { destroyTelegramClient, getActiveTelegramClient, reconnect as reconnectTelegramClient } from '../lib/telegram';
 import { storeMediaDataUrl } from '../lib/mediaStore';
 import { registerNotificationClickHandler, notifyNewMessage, sendTestNotification, forceTestNotification } from '../lib/notifications';
 import { useVirtualRows } from '../lib/useVirtualRows';
@@ -30,6 +30,7 @@ import {
   buildLiveChatFromPeer,
 
   mirrorLiveChatToCRM,
+  flushMirrorQueue,
   containsTmeLink,
   searchChatForTmeLink,
   LiveChat,
@@ -68,6 +69,17 @@ function formatTelegramTime(dateStr?: string) {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
+/** Compact "just now / 2 min ago" label for sync timestamps. */
+function formatAgo(ts: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (seconds < 15) return 'just now';
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  return `${hours}h ago`;
+}
+
 const CHAT_CACHE_KEY = 'realtydesk_chats_cache_v1';
 
 /** Instant local-first chat list so the inbox paints before any network call. */
@@ -84,7 +96,7 @@ function readCachedChats(): any[] {
 
 function writeCachedChats(chats: any[]): void {
   try {
-    const light = chats.slice(0, 500).map((chat: any) => {
+    const light = chats.slice(0, 200).map((chat: any) => {
       const { entity, inputEntity, ...rest } = chat;
       const contactId = rest.contactId
         ? {
@@ -302,23 +314,50 @@ function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function readKnownClientIds(): string[] {
+// Known-client ids are kept in memory and persisted lazily. Parsing/serializing
+// thousands of ids on every live message caused avoidable main-thread work.
+let knownClientIdsCache: Set<string> | null = null;
+let knownClientIdsWriteTimer: ReturnType<typeof setTimeout> | undefined;
+
+function getKnownClientIds(): Set<string> {
+  if (knownClientIdsCache) return knownClientIdsCache;
   try {
     const raw = localStorage.getItem(KNOWN_CLIENT_IDS_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed)
-      ? parsed.filter((n: any) => typeof n === 'string' && n.trim())
-      : [];
+    knownClientIdsCache = new Set(
+      Array.isArray(parsed)
+        ? parsed.filter((n: any) => typeof n === 'string' && n.trim())
+        : []
+    );
   } catch {
-    return [];
+    knownClientIdsCache = new Set();
   }
+  return knownClientIdsCache;
 }
 
-function writeKnownClientIds(ids: string[]): void {
+function scheduleKnownClientIdsFlush(): void {
+  if (knownClientIdsWriteTimer) clearTimeout(knownClientIdsWriteTimer);
+  knownClientIdsWriteTimer = setTimeout(() => {
+    knownClientIdsWriteTimer = undefined;
+    try {
+      localStorage.setItem(
+        KNOWN_CLIENT_IDS_KEY,
+        JSON.stringify(Array.from(getKnownClientIds()).slice(0, 5000))
+      );
+    } catch {}
+  }, 2000);
+}
+
+export function flushKnownClientIds(): void {
+  if (!knownClientIdsCache) return;
+  if (knownClientIdsWriteTimer) {
+    clearTimeout(knownClientIdsWriteTimer);
+    knownClientIdsWriteTimer = undefined;
+  }
   try {
     localStorage.setItem(
       KNOWN_CLIENT_IDS_KEY,
-      JSON.stringify(Array.from(new Set(ids)).slice(0, 5000))
+      JSON.stringify(Array.from(knownClientIdsCache).slice(0, 5000))
     );
   } catch {}
 }
@@ -330,13 +369,16 @@ function writeKnownClientIds(ids: string[]): void {
  */
 function seedKnownClients(chats: any[]): void {
   if (!Array.isArray(chats) || chats.length === 0) return;
-  const known = new Set(readKnownClientIds());
-  const before = known.size;
+  const known = getKnownClientIds();
+  let changed = false;
   for (const chat of chats) {
     const key = getClientStatKey(chat);
-    if (key) known.add(key);
+    if (key && !known.has(key)) {
+      known.add(key);
+      changed = true;
+    }
   }
-  if (known.size !== before) writeKnownClientIds(Array.from(known));
+  if (changed) scheduleKnownClientIdsFlush();
 }
 
 function readDailyStatEntry(key: string): DailyStatEntry {
@@ -948,10 +990,10 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     const id = getClientStatKey(chat);
     if (!id) return;
     if (readDailyStatEntry(DAILY_INCOMING_KEY).ids.includes(id)) return;
-    const known = new Set(readKnownClientIds());
+    const known = getKnownClientIds();
     if (known.has(id)) return;
     known.add(id);
-    writeKnownClientIds(Array.from(known));
+    scheduleKnownClientIdsFlush();
     bumpDailyStat('incoming', getChatDisplayName(chat), id);
     refreshDailyStats();
   }, [bumpDailyStat, refreshDailyStats]);
@@ -1006,6 +1048,13 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   // Aggregate live-socket health across all linked accounts.
   const [liveStatus, setLiveStatus] = useState<LiveStatus>('connecting');
   const [displayLiveStatus, setDisplayLiveStatus] = useState<LiveStatus>('connecting');
+  // Per-account health so a single failing account can't hide behind a healthy one.
+  const [accountStatuses, setAccountStatuses] = useState<Record<string, LiveStatus>>({});
+  // null = not checked yet. false = the CRM server could not be reached.
+  const [serverReachable, setServerReachable] = useState<boolean | null>(null);
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
+  const [retryingConnection, setRetryingConnection] = useState(false);
+  const [unlinkingId, setUnlinkingId] = useState<string | null>(null);
   const liveStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (liveStatusTimerRef.current) {
@@ -1185,6 +1234,8 @@ export default function Inbox({ role, onAddTelegram }: Props) {
 
   const handleUnlink = async (id: string, name: string) => {
     if (!window.confirm(`Are you sure you want to disconnect Telegram account "${name}"?`)) return;
+    if (unlinkingId) return;
+    setUnlinkingId(id);
     try {
       // Drop the local MTProto session too ΓÇö the account is revoked, so its
       // keychain entry should not linger (the session is only usable on this
@@ -1194,29 +1245,40 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       await api.unlinkTelegramAccount(id);
       await fetchAccounts();
       loadChats(false);
+      notify(`Disconnected ${name}`, 'success');
     } catch (err: any) {
       notify(err.message || 'Failed to unlink account');
+    } finally {
+      setUnlinkingId(null);
     }
   };
 
   const handleToggleArchive = async (chatId: string, currentArchived: boolean) => {
+    const nextArchived = !currentArchived;
+    // Optimistic: move the chat immediately, roll back if the server rejects it.
+    const chat = chatsRef.current.find((c) => c._id === chatId || c.externalChatId === chatId);
+    setChats((prev) =>
+      prev.map((c) =>
+        c._id === chatId || c.externalChatId === chatId
+          ? { ...c, isArchived: nextArchived }
+          : c
+      )
+    );
+    if (nextArchived && chat) countArchived(chat);
     try {
-      await api.toggleArchiveChat(chatId, !currentArchived);
-      if (!currentArchived) {
-        const chat = chatsRef.current.find((c) => c._id === chatId || c.externalChatId === chatId);
-        if (chat) countArchived(chat);
-      }
-      setChats((prev) =>
-        prev.map((c) =>
-          c._id === chatId || c.externalChatId === chatId
-            ? { ...c, isArchived: !currentArchived }
-            : c
-        )
-      );
+      await api.toggleArchiveChat(chatId, nextArchived);
       // Re-fetch repeated IDs from server since archiving changes collision status
       fetchRepeatedIds();
     } catch (err: any) {
+      setChats((prev) =>
+        prev.map((c) =>
+          c._id === chatId || c.externalChatId === chatId
+            ? { ...c, isArchived: currentArchived }
+            : c
+        )
+      );
       notify(err.message || 'Failed to update archive status');
+      throw err;
     }
   };
 
@@ -1305,13 +1367,19 @@ export default function Inbox({ role, onAddTelegram }: Props) {
   }, []);
 
   const loadChatsInFlightRef = useRef(false);
+  const loadChatsQueuedRef = useRef(false);
   const lastLoadChatsAtRef = useRef(0);
 
   // Refreshes the chat list. Each account is resolved to its own local MTProto
   // client, so chats always come from the account that actually owns them.
   const loadChats = useCallback(async (showLoading = false, force = false) => {
     const now = Date.now();
-    if (loadChatsInFlightRef.current) return;
+    if (loadChatsInFlightRef.current) {
+      // Coalesce: remember that another refresh was requested and run one
+      // trailing refresh when the current one finishes, instead of dropping it.
+      loadChatsQueuedRef.current = true;
+      return;
+    }
     if (!showLoading && !force && now - lastLoadChatsAtRef.current < 4000) return;
     loadChatsInFlightRef.current = true;
     lastLoadChatsAtRef.current = now;
@@ -1343,7 +1411,14 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         Promise.all(liveChatsPromises),
         api
           .listChats({ scope, q: debouncedQuery || undefined, includeArchived: true })
-          .catch(() => ({ chats: [] })),
+          .then((res) => {
+            setServerReachable(true);
+            return res;
+          })
+          .catch(() => {
+            setServerReachable(false);
+            return { chats: [] };
+          }),
       ]);
 
       setConnectedAccounts(liveResults.filter((r) => r.connected).length);
@@ -1370,13 +1445,40 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       });
       // Refresh server-authoritative repeated-IDs after chats load
       fetchRepeatedIds();
+      setLastSyncedAt(Date.now());
     } catch (err) {
       console.warn('[Inbox] Error loading chats:', err);
     } finally {
       loadChatsInFlightRef.current = false;
       if (showLoading) setLoadingChats(false);
+      if (loadChatsQueuedRef.current) {
+        loadChatsQueuedRef.current = false;
+        setTimeout(() => { loadChats(false, true); }, 250);
+      }
     }
   }, [telegramAccounts, scope, debouncedQuery, fetchRepeatedIds, mergePendingNewChats]);
+
+  // Manual "Retry" from the connection banner. Re-opens any account whose
+  // socket dropped, then reconciles the chat list once.
+  const retryConnection = useCallback(async () => {
+    if (retryingConnection) return;
+    setRetryingConnection(true);
+    try {
+      const accounts = telegramAccounts.length > 0 ? telegramAccounts : await fetchAccounts();
+      await Promise.all(
+        accounts.map((acc) =>
+          reconnectTelegramClient(String(acc._id)).catch(() => null)
+        )
+      );
+      await loadChats(false, true);
+      fetchRepeatedIds(true);
+      flushMirrorQueue();
+    } catch (err) {
+      console.warn('[Inbox] Manual reconnect failed:', err);
+    } finally {
+      setRetryingConnection(false);
+    }
+  }, [retryingConnection, telegramAccounts, loadChats, fetchRepeatedIds]);
 
   // When the window regains focus or the network comes back, reconcile with
   // Telegram. OS sleep can leave a socket "connected" while updates stopped,
@@ -1426,12 +1528,24 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     }, 30_000);
 
     (async () => {
-      // Local-first: hydrate the durable SQLite cache in parallel with the
-      // account lookup so an offline launch still paints the inbox.
-      const [accounts, cachedChats] = await Promise.all([
-        fetchAccounts(),
-        loadCachedChats().catch(() => [] as any[]),
-      ]);
+      // Local-first: start every independent piece of work at once so the inbox
+      // paints from cache immediately and Telegram connects without waiting for
+      // the server round-trip.
+      const accountsPromise = fetchAccounts();
+      const cachedPromise = loadCachedChats().catch(() => [] as any[]);
+      const dbPromise = api
+        .listChats({ scope, includeArchived: true })
+        .then((res) => {
+          if (!isCancelled) setServerReachable(true);
+          return (res.chats || []) as any[];
+        })
+        .catch(() => {
+          if (!isCancelled) setServerReachable(false);
+          return [] as any[];
+        });
+
+      // 1. Paint cached chats first (local cache, no network needed).
+      const cachedChats = await cachedPromise;
       if (isCancelled) return;
       if (cachedChats.length > 0) {
         seedKnownClients(cachedChats);
@@ -1443,24 +1557,26 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         });
         setLoadingChats(false);
       }
+
+      const accounts = await accountsPromise;
+      if (isCancelled) return;
       if (accounts.length === 0) {
         setLiveStatus(navigator.onLine === false ? 'waiting' : 'offline');
         if (cachedChats.length === 0) setLoadingChats(false);
         return;
       }
 
-      if (chats.length === 0 && cachedChats.length === 0) setLoadingChats(true);
-      try {
-        // 1. Show DB chats immediately so the inbox renders in ~300ms instead of
-        // waiting for all Telegram MTProto sessions & dialogs to finish.
-        const dbRes = await api
-          .listChats({ scope, includeArchived: true })
-          .catch(() => ({ chats: [] as any[] }));
-        if (isCancelled) return;
-        const dbChats: any[] = dbRes.chats || [];
-        if (dbChats.length > 0) {
-          seedKnownClients(dbChats);
-          const initialChats = mergePendingNewChats(dbChats);
+      if (chatsRef.current.length === 0) setLoadingChats(true);
+
+      // 2. Server chats are merged the moment they land, without blocking the
+      // Telegram connects below.
+      let dbChats: any[] = [];
+      dbPromise
+        .then((chats) => {
+          if (isCancelled || chats.length === 0) return;
+          dbChats = chats;
+          seedKnownClients(chats);
+          const initialChats = mergePendingNewChats(chats);
           const pendingKeys = new Set(pendingNewChats.current.keys());
           setChats((prev) => mergeChatLists(prev, initialChats, selectedChatIdRef.current, pendingKeys));
           setSelectedChatId((curr) => {
@@ -1469,18 +1585,24 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             return initialChats[0]._id || initialChats[0].externalChatId;
           });
           setLoadingChats(false);
-        }
+        })
+        .catch(() => {});
 
-        // 2. Connect each Telegram account in parallel for faster startup on low networks.
-        // Chats appear progressively as each account responds.
+      try {
+        // 3. Connect each Telegram account in parallel. Chats appear
+        // progressively as each account responds.
         const statuses = new Map<string, LiveStatus>();
         const publishStatus = () => {
           const values = [...statuses.values()];
-          setConnectedAccounts(values.filter((s) => s === 'live').length);
-          if (values.includes('live')) setLiveStatus('live');
-          else if (values.includes('waiting')) setLiveStatus('waiting');
+          const liveCount = values.filter((s) => s === 'live').length;
+          setConnectedAccounts(liveCount);
+          setAccountStatuses(Object.fromEntries(statuses));
+          const online = navigator.onLine !== false;
+          if (!online) setLiveStatus('waiting');
+          else if (statuses.size > 0 && liveCount === statuses.size) setLiveStatus('live');
           else if (values.includes('connecting')) setLiveStatus('connecting');
-          else setLiveStatus(navigator.onLine === false ? 'waiting' : 'connecting');
+          else if (values.includes('waiting')) setLiveStatus('waiting');
+          else setLiveStatus(liveCount > 0 ? 'connecting' : 'offline');
         };
 
         const accumulatedLive: any[] = [];
@@ -1649,6 +1771,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                 } finally {
                   // Always reconcile with the dialog list for authoritative ids.
                   loadChats(false, true);
+                 flushMirrorQueue();
                   setTimeout(() => unknownChatFetches.current.delete(fetchKey), 15_000);
                 }
               })();
@@ -1777,15 +1900,18 @@ export default function Inbox({ role, onAddTelegram }: Props) {
               console.warn(`[Inbox] Bulk sync note for ${acc.phoneMasked || acc._id}:`, syncErr.message);
             }
           }
-          // After all accounts are synced, re-fetch repeated IDs ΓÇö now they are accurate
+          // After all accounts are synced, re-fetch repeated IDs — now they are accurate
           if (!isCancelled) {
             setSyncProgress(null);
+            setLastSyncedAt(Date.now());
             fetchRepeatedIds();
           }
         })();
         // ΓöÇΓöÇ END BULK STARTUP SYNC ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-        const finalChats = mergePendingNewChats(mergeLiveAndDbChats(liveChats, dbChats));
+        const finalDbChats = await dbPromise;
+        if (isCancelled) return;
+        const finalChats = mergePendingNewChats(mergeLiveAndDbChats(liveChats, finalDbChats));
         const pendingKeys = new Set(pendingNewChats.current.keys());
         setChats((prev) => mergeChatLists(prev, finalChats, selectedChatIdRef.current, pendingKeys));
         setSelectedChatId((curr) => {
@@ -1793,6 +1919,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
           if (isNarrowViewport()) return null;
           return finalChats.length > 0 ? finalChats[0]._id || finalChats[0].externalChatId : null;
         });
+        setLastSyncedAt(Date.now());
       } catch (err) {
         console.warn('[Inbox] Real-time setup note:', err);
         const res = await api.listChats({ scope, includeArchived: true }).catch(() => ({ chats: [] }));
@@ -1811,6 +1938,7 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       isCancelled = true;
       if (pollTimer) clearInterval(pollTimer);
       for (const cleanup of cleanups) cleanup();
+      flushKnownClientIds();
     };
   }, [role, scope]);
 
@@ -1924,12 +2052,29 @@ export default function Inbox({ role, onAddTelegram }: Props) {
       )
       .join('\n');
     if (sig === chatCacheSigRef.current) return;
+    let idleHandle: number | undefined;
     const timer = setTimeout(() => {
-      chatCacheSigRef.current = sig;
-      writeCachedChats(chats);
-      cacheChatsToDb(chats).catch(() => {});
-    }, 2500);
-    return () => clearTimeout(timer);
+      const run = () => {
+        chatCacheSigRef.current = sig;
+        writeCachedChats(chats);
+        cacheChatsToDb(chats).catch(() => {});
+      };
+      if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+        idleHandle = (window as any).requestIdleCallback(run, { timeout: 2500 });
+      } else {
+        run();
+      }
+    }, 6000);
+    return () => {
+      clearTimeout(timer);
+      if (
+        idleHandle !== undefined &&
+        typeof window !== 'undefined' &&
+        'cancelIdleCallback' in window
+      ) {
+        (window as any).cancelIdleCallback(idleHandle);
+      }
+    };
   }, [chats]);
 
   // A new filter/query is a new list; start it at the top.
@@ -2041,6 +2186,48 @@ export default function Inbox({ role, onAddTelegram }: Props) {
     }
   }
 
+  // Derived connection state for the header pill and the persistent banner.
+  const totalAccounts = telegramAccounts.length;
+  const onlineNow = typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
+  const allAccountsLive = totalAccounts > 0 && connectedAccounts >= totalAccounts;
+  let connKind: 'live' | 'partial' | 'offline' | 'server' | 'reconnecting';
+  if (!onlineNow) connKind = 'offline';
+  else if (allAccountsLive) connKind = 'live';
+  else if (connectedAccounts > 0) connKind = 'partial';
+  else if (serverReachable === false) connKind = 'server';
+  else if (totalAccounts === 0) connKind = 'offline';
+  else connKind = 'reconnecting';
+
+  const connLabel =
+    connKind === 'live'
+      ? 'Live'
+      : connKind === 'partial'
+        ? `${connectedAccounts}/${totalAccounts} live`
+        : connKind === 'offline'
+          ? onlineNow
+            ? 'Offline'
+            : 'Waiting'
+          : connKind === 'server'
+            ? 'Server offline'
+            : loadingChats
+              ? 'Starting…'
+              : 'Connecting';
+
+  const connDetail =
+    connKind === 'partial'
+      ? `${connectedAccounts} of ${totalAccounts} accounts connected. Retrying the rest automatically.`
+      : connKind === 'offline'
+        ? onlineNow
+          ? 'Telegram is not connected — showing saved chats. Sending resumes automatically.'
+          : "You're offline — showing saved chats. Sending resumes automatically."
+        : connKind === 'server'
+          ? "Can't reach the RealtyDesk server. Telegram may still be live."
+          : loadingChats
+            ? 'Loading saved conversations…'
+            : 'Connecting to Telegram…';
+
+  const showConnBanner = connKind !== 'live' || syncProgress !== null;
+
   return (
     <div className={`inbox-container ${selectedChatId ? 'has-active-chat' : ''} ${dailyStatsOpen ? 'has-daily-stats' : ''}`}>
       {/* Telegram Slide-out Navigation Drawer */}
@@ -2115,15 +2302,48 @@ export default function Inbox({ role, onAddTelegram }: Props) {
                         </div>
                       </div>
                     </div>
+                    {(() => {
+                      const st = accountStatuses[String(acc._id)] || 'connecting';
+                      return (
+                        <span
+                          className={`tg-acc-status ${
+                            st === 'live' ? 'live' : st === 'waiting' ? 'waiting' : 'offline'
+                          }`}
+                          title={
+                            st === 'live'
+                              ? 'Live connection active'
+                              : st === 'waiting'
+                                ? 'Waiting for network'
+                                : 'Connecting to Telegram'
+                          }
+                        >
+                          <span
+                            className={
+                              st === 'live'
+                                ? 'live-pulse-dot'
+                                : st === 'waiting'
+                                  ? 'waiting-dot'
+                                  : 'offline-dot'
+                            }
+                          />
+                          {st === 'live' ? 'Live' : st === 'waiting' ? 'Waiting' : 'Connecting'}
+                        </span>
+                      );
+                    })()}
                     <button
                       className="tg-unlink-btn"
                       title="Disconnect account"
+                      disabled={unlinkingId === acc._id}
                       onClick={(e) => {
                         e.stopPropagation();
                         handleUnlink(acc._id, acc.displayName || acc.phoneMasked || acc.telegramUserId);
                       }}
                     >
-                      <TrashIcon size={14} />
+                      {unlinkingId === acc._id ? (
+                        <span className="inline-btn-spinner dark" />
+                      ) : (
+                        <TrashIcon size={14} />
+                      )}
                     </button>
                   </div>
                 ))}
@@ -2199,28 +2419,34 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             <div className="tg-drawer-section-title">
               <span>Telegram connection</span>
             </div>
-            <div className={`tg-drawer-status-card ${displayLiveStatus === 'live' ? '' : displayLiveStatus === 'waiting' ? 'is-waiting' : 'is-offline'}`}>
+            <div className={`tg-drawer-status-card ${connKind === 'live' ? '' : connKind === 'offline' ? 'is-offline' : 'is-waiting'}`}>
               <div className="tg-drawer-status-row">
-                <span className={displayLiveStatus === 'live' ? 'live-pulse-dot' : displayLiveStatus === 'waiting' ? 'waiting-dot' : 'offline-dot'} />
+                <span className={connKind === 'live' ? 'live-pulse-dot' : connKind === 'offline' ? 'offline-dot' : 'waiting-dot'} />
                 <span className="tg-drawer-status-label">
-                  {displayLiveStatus === 'live'
-                    ? `Live ┬╖ ${connectedAccounts} account${connectedAccounts === 1 ? '' : 's'} connected`
-                    : displayLiveStatus === 'waiting'
-                    ? 'Waiting for networkΓÇª'
-                    : displayLiveStatus === 'connecting'
-                    ? 'ReconnectingΓÇª'
-                    : 'Not connected'}
+                  {connKind === 'live'
+                    ? `Live · ${connectedAccounts} account${connectedAccounts === 1 ? '' : 's'} connected`
+                    : connKind === 'partial'
+                      ? `${connectedAccounts} of ${totalAccounts} accounts connected`
+                      : connKind === 'offline'
+                        ? onlineNow
+                          ? 'Telegram offline'
+                          : 'Waiting for network…'
+                        : connKind === 'server'
+                          ? 'Server unreachable'
+                          : 'Reconnecting…'}
                 </span>
               </div>
-              <p>
-                {displayLiveStatus === 'live'
-                  ? 'Messages update live from your linked Telegram accounts. No manual syncing needed.'
-                  : displayLiveStatus === 'waiting'
-                  ? 'No network connection. Telegram will reconnect automatically when your connection returns.'
-                  : displayLiveStatus === 'connecting'
-                  ? 'Restoring the Telegram live connection automaticallyΓÇª'
-                  : 'Link a Telegram account to send and receive messages live. Until then you are viewing saved history.'}
-              </p>
+              <p>{connDetail}</p>
+              {connKind !== 'live' && (
+                <button
+                  type="button"
+                  className="secondary-btn small-btn drawer-retry-btn"
+                  onClick={retryConnection}
+                  disabled={retryingConnection}
+                >
+                  {retryingConnection ? 'Retrying…' : 'Retry now'}
+                </button>
+              )}
             </div>
           </div>
 
@@ -2260,6 +2486,51 @@ export default function Inbox({ role, onAddTelegram }: Props) {
         </div>
       )}
       <aside className="chat-list-panel">
+        {showConnBanner && (
+          <div
+            className={`conn-banner is-${connKind}${syncProgress ? ' is-syncing' : ''}`}
+            role="status"
+            aria-live="polite"
+          >
+            <span
+              className={`conn-banner-dot ${
+                connKind === 'live' ? 'live' : connKind === 'offline' ? 'offline' : 'waiting'
+              }`}
+            />
+            <div className="conn-banner-copy">
+              <strong>
+                {syncProgress
+                  ? 'Saving contacts in background…'
+                  : connKind === 'partial'
+                    ? 'Some accounts are offline'
+                    : connKind === 'server'
+                      ? 'Server unreachable'
+                      : connKind === 'offline'
+                        ? onlineNow
+                          ? 'Telegram offline'
+                          : 'Waiting for network'
+                        : loadingChats
+                          ? 'Starting…'
+                          : 'Connecting to Telegram…'}
+              </strong>
+              <span>
+                {syncProgress
+                  ? `You can keep chatting — ${syncProgress.done}/${syncProgress.total} saved`
+                  : connDetail}
+              </span>
+            </div>
+            {connKind !== 'live' && (
+              <button
+                type="button"
+                className="conn-banner-retry"
+                onClick={retryConnection}
+                disabled={retryingConnection}
+              >
+                {retryingConnection ? <span className="inline-btn-spinner dark" /> : 'Retry'}
+              </button>
+            )}
+          </div>
+        )}
         <div className="chat-list-header">
           <div className="list-title-row">
             <button
@@ -2273,32 +2544,38 @@ export default function Inbox({ role, onAddTelegram }: Props) {
             <h1 className="list-title">Inbox</h1>
             <button
               type="button"
-              className="icon-btn"
+              className={`icon-btn${loadingChats ? ' is-loading' : ''}`}
               onClick={() => { loadChats(true); fetchRepeatedIds(true); }}
               title="Refresh conversations"
               aria-label="Refresh conversations"
+              disabled={loadingChats}
             >
               Γå╗
             </button>
             <span className="list-count">
               {filteredChats.length} {filteredChats.length === 1 ? 'chat' : 'chats'}
             </span>
-            <div
-              className={`live-status-pill ${displayLiveStatus === 'live' ? '' : displayLiveStatus === 'waiting' ? 'waiting' : 'offline'}`}
-              title={
-                displayLiveStatus === 'live'
-                  ? 'Live Telegram connection active'
-                  : displayLiveStatus === 'waiting'
-                  ? 'Waiting for networkΓÇö will reconnect automatically'
-                  : displayLiveStatus === 'connecting'
-                  ? 'Reconnecting to TelegramΓÇª'
-                  : 'Telegram connection offline ΓÇö retrying automatically'
-              }
-            >
-              <span className={displayLiveStatus === 'live' ? 'live-pulse-dot' : displayLiveStatus === 'waiting' ? 'waiting-dot' : 'offline-dot'} />
-              <span>
-                {displayLiveStatus === 'live' ? 'Live' : displayLiveStatus === 'waiting' ? 'Waiting' : displayLiveStatus === 'connecting' ? 'Connecting' : 'Offline'}
+            {lastSyncedAt && (
+              <span className="list-synced" title="Last successful sync">
+                Updated {formatAgo(lastSyncedAt)}
               </span>
+            )}
+            <div
+              className={`live-status-pill ${
+                connKind === 'live' ? '' : connKind === 'offline' ? 'offline' : 'waiting'
+              }`}
+              title={connDetail}
+            >
+              <span
+                className={
+                  connKind === 'live'
+                    ? 'live-pulse-dot'
+                    : connKind === 'offline'
+                      ? 'offline-dot'
+                      : 'waiting-dot'
+                }
+              />
+              <span>{connLabel}</span>
             </div>
           </div>
 
@@ -2725,7 +3002,7 @@ function ChatThread({
   onDeleteTemplate: (id: string) => Promise<void> | void;
   onDeleteAllTemplates: () => Promise<void> | void;
   toggleNotes: () => void;
-  onToggleArchive: () => void;
+  onToggleArchive: () => void | Promise<void>;
   onChatTransferred: () => void;
   onMessageSent: (preview?: string, direction?: 'in' | 'out', at?: string) => void;
   notify: (message: string, kind?: 'error' | 'success') => void;
@@ -2771,6 +3048,10 @@ function ChatThread({
   const [oldestId, setOldestId] = useState<number | undefined>(() => cachedThread?.oldestId);
   const [draft, setDraftState] = useState(() => draftStore.get(draftKey)?.text ?? '');
   const [sending, setSending] = useState(false);
+  const [blockPending, setBlockPending] = useState(false);
+  const [archivePending, setArchivePending] = useState(false);
+  const [refreshingThread, setRefreshingThread] = useState(false);
+  const [pendingOutgoing, setPendingOutgoing] = useState<Array<{ id: string; text: string; at: string; failed?: boolean }>>([]);
   const [previewMedia, setPreviewMedia] = useState<{ url: string; items: string[]; index: number } | null>(null);
   const [replyingTo, setReplyingTo] = useState<any | null>(null);
   useEffect(() => {
@@ -2852,12 +3133,13 @@ function ChatThread({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sqliteKey]);
 
-  // Debounced write-through so the thread survives relaunch/offline open.
+  // Debounced incremental write-through so the thread survives relaunch/offline
+  // open without rewriting the whole thread on every new message.
   useEffect(() => {
     if (messages.length === 0) return;
     const timer = setTimeout(() => {
-      cacheMessagesToDb(sqliteKey, messages, true).catch(() => {});
-    }, 1200);
+      cacheMessagesToDb(sqliteKey, messages, false).catch(() => {});
+    }, 3000);
     return () => clearTimeout(timer);
   }, [messages, sqliteKey]);
 
@@ -2927,8 +3209,9 @@ function ChatThread({
   }, [translations]);
 
   // Auto-translate recent messages into the agent's target language.
-  // Only the newest window is translated, in batches, so a 500-message thread
-  // never floods the network/UI on open.
+  // Only the newest window is translated, with a small concurrency pool, so a
+  // 500-message thread never floods the network/UI on open. Work pauses while
+  // the window is hidden and is abandoned when the chat switches.
   useEffect(() => {
     try { if (localStorage.getItem('rd_auto_translate') === '0') return; } catch {}
     const target = getTargetLanguage();
@@ -2939,29 +3222,51 @@ function ChatThread({
         const id = String(m._id || m.telegramMessageId || '');
         return id && translationsRef.current[id] === undefined;
       })
-      .slice(0, 40);
+      .slice(0, 12);
     if (pending.length === 0) return;
+
     let cancelled = false;
-    (async () => {
-      const updates: Record<string, string> = {};
-      let count = 0;
-      for (const m of pending) {
-        if (cancelled) return;
+    let cursor = 0;
+    const updates: Record<string, string> = {};
+    let sinceFlush = 0;
+
+    const flush = () => {
+      if (cancelled) return;
+      const batch = { ...updates };
+      setTranslations((prev) => ({ ...prev, ...batch }));
+    };
+
+    const worker = async (): Promise<void> => {
+      while (!cancelled) {
+        if (typeof document !== 'undefined' && document.hidden) {
+          // Wait for visibility instead of burning network while backgrounded.
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          continue;
+        }
+        const idx = cursor;
+        if (idx >= pending.length) return;
+        cursor += 1;
+        const m = pending[idx];
         const id = String(m._id || m.telegramMessageId || '');
-        const tr = await translateText(m.text, target);
-        if (cancelled) return;
-        updates[id] = tr && tr !== m.text ? tr : '';
-        count += 1;
-        if (count % 4 === 0) {
-          const batch = { ...updates };
-          setTranslations((prev) => ({ ...prev, ...batch }));
+        try {
+          const tr = await translateText(m.text, target);
+          if (cancelled) return;
+          updates[id] = tr && tr !== m.text ? tr : '';
+        } catch {
+          if (cancelled) return;
+          updates[id] = '';
+        }
+        sinceFlush += 1;
+        if (sinceFlush >= 4) {
+          sinceFlush = 0;
+          flush();
         }
       }
-      if (!cancelled) {
-        const batch = { ...updates };
-        setTranslations((prev) => ({ ...prev, ...batch }));
-      }
-    })();
+    };
+
+    const concurrency = Math.min(3, pending.length);
+    Promise.all(Array.from({ length: concurrency }, () => worker())).then(flush);
+
     return () => { cancelled = true; };
   }, [messages]);
 
@@ -3031,6 +3336,8 @@ function ChatThread({
         setLoadingMessages(true);
         shouldScrollToBottomRef.current = true;
         initialScrollDoneRef.current = false;
+      } else if (isInitial && hasCached) {
+        setRefreshingThread(true);
       }
       let msgs: any[] = [];
       let nextHasMore = false;
@@ -3128,6 +3435,7 @@ function ChatThread({
     } finally {
       // Keep showing skeletons while the MTProto client is still connecting
       // and we don't have messages yet, so we don't flash "No messages yet".
+      setRefreshingThread(false);
       if (isInitial && !resolvingClient) {
         setLoadingMessages(false);
       } else if (!isInitial) {
@@ -3437,6 +3745,7 @@ function ChatThread({
     const rawText = draft.trim();
     const filesToSend = attachments.map((a) => a.file);
     const previewUrl = attachments[0]?.dataUrl;
+    let pendingId: string | null = null;
     setSending(true);
 
     try {
@@ -3452,6 +3761,22 @@ function ChatThread({
       const replyTo = replyingTo?.telegramMessageId ? Number(replyingTo.telegramMessageId) : undefined;
 
       if (chatClient && chatClient.connected && peer && (textToSend || filesToSend.length > 0)) {
+        pendingId = `pending-${Date.now()}`;
+        const pendingText = textToSend || (filesToSend.length > 0 ? '[Photo]' : '');
+        setMessages((prev) => [
+          ...prev,
+          {
+            _id: pendingId,
+            telegramMessageId: pendingId,
+            direction: 'out',
+            senderType: outgoingSenderType,
+            text: pendingText,
+            sentAt: new Date().toISOString(),
+            mediaRef: filesToSend.length > 0 ? previewUrl : undefined,
+            _pending: true,
+            _failed: false,
+          },
+        ]);
         const sent = await sendLiveTelegramMessage(chatClient, peer, {
           text: filesToSend.length > 0 ? undefined : textToSend,
           caption: filesToSend.length > 0 ? textToSend : undefined,
@@ -3469,9 +3794,12 @@ function ChatThread({
           replyToMsgId: s.replyToMsgId || (replyTo ? String(replyTo) : undefined),
         }));
         setMessages((prev) => {
-          const existing = new Set(prev.map((m) => String(m.telegramMessageId)));
+          const withoutPending = prev.filter(
+            (m) => String(m._id) !== pendingId && String(m.telegramMessageId) !== pendingId
+          );
+          const existing = new Set(withoutPending.map((m) => String(m.telegramMessageId)));
           const fresh = outgoing.filter((m) => !existing.has(String(m.telegramMessageId)));
-          return fresh.length ? [...prev, ...fresh] : prev;
+          return fresh.length ? [...withoutPending, ...fresh] : withoutPending;
         });
         mirrorLiveChatToCRM(chatAccountId, chat, outgoing).catch(() => { });
         setReplyingTo(null);
@@ -3509,6 +3837,15 @@ function ChatThread({
       const preview = filesToSend.length > 0 ? (textToSend || '[Photo]') : (textToSend || '');
       onMessageSent(preview, 'out', new Date().toISOString());
     } catch (err: any) {
+      if (pendingId) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            String(m._id) === pendingId || String(m.telegramMessageId) === pendingId
+              ? { ...m, _pending: false, _failed: true }
+              : m
+          )
+        );
+      }
       const errMsg = err?.message || String(err);
       if (errMsg.includes('USER_IS_BLOCKED') || errMsg.includes('YOU_BLOCKED_USER')) {
         notify('This contact has blocked you (or is blocked). The chat is now flagged.');
@@ -3625,20 +3962,32 @@ function ChatThread({
         <div className="thread-header-actions">
           <button
             className="secondary-btn small-btn"
-            onClick={() => fetchMessages(true)}
+            onClick={async () => {
+              if (refreshingThread) return;
+              setRefreshingThread(true);
+              try {
+                await fetchMessages(true);
+              } finally {
+                setRefreshingThread(false);
+              }
+            }}
             title="Refresh messages"
+            disabled={refreshingThread}
           >
-            Refresh
+            {refreshingThread ? <span className="inline-btn-spinner dark" /> : 'Refresh'}
           </button>
           <button
             className={`secondary-btn small-btn ${isBlocked ? 'unblock-action-btn' : 'block-action-btn'}`}
+            disabled={blockPending}
             onClick={async () => {
+              if (blockPending) return;
               if (!isBlocked) {
                 const ok = window.confirm(
                   `Block ${contactName}? They will not be able to message you, and this chat will be flagged.`
                 );
                 if (!ok) return;
               }
+              setBlockPending(true);
               try {
                 await api.toggleBlockChat(chat._id, !isBlocked);
                 chat.isBlocked = !isBlocked;
@@ -3646,17 +3995,40 @@ function ChatThread({
                 onMessageSent();
               } catch (err: any) {
                 notify(err.message || 'Failed to toggle block');
+              } finally {
+                setBlockPending(false);
               }
             }}
           >
-            {isBlocked ? 'Unblock' : 'Block'}
+            {blockPending ? (
+              <span className="inline-btn-spinner dark" />
+            ) : isBlocked ? (
+              'Unblock'
+            ) : (
+              'Block'
+            )}
           </button>
           <button
             className="secondary-btn small-btn"
-            onClick={onToggleArchive}
+            onClick={async () => {
+              if (archivePending) return;
+              setArchivePending(true);
+              try {
+                await onToggleArchive();
+              } finally {
+                setArchivePending(false);
+              }
+            }}
             title={chat.isArchived ? 'Move to active chats' : 'Archive this conversation'}
+            disabled={archivePending}
           >
-            {chat.isArchived ? <UnarchiveIcon size={13} /> : <ArchiveIcon size={13} />}
+            {archivePending ? (
+              <span className="inline-btn-spinner dark" />
+            ) : chat.isArchived ? (
+              <UnarchiveIcon size={13} />
+            ) : (
+              <ArchiveIcon size={13} />
+            )}
             <span className="btn-label">{chat.isArchived ? 'Unarchive' : 'Archive'}</span>
           </button>
           <button className="secondary-btn small-btn" onClick={toggleNotes} title="Open lead notes">
@@ -3734,6 +4106,12 @@ function ChatThread({
           }
         }}
       >
+        {refreshingThread && (
+          <div className="thread-refresh-bar">
+            <span className="inline-btn-spinner dark" />
+            <span>Refreshing from Telegram…</span>
+          </div>
+        )}
         {hasMore && <div ref={topSentinelRef} className="lazy-sentinel" aria-hidden="true" />}
         {hasMore && (
           <div className="load-older-banner">
@@ -3777,6 +4155,25 @@ function ChatThread({
         )}
         {loadingMessages ? (
           <MessageSkeletons />
+        ) : messages.length === 0 && resolvingClient ? (
+          <div className="no-messages-placeholder">
+            <span className="inline-btn-spinner dark" style={{ marginRight: 6 }} />
+            Connecting to Telegram…
+            <button
+              type="button"
+              className="secondary-btn small-btn"
+              style={{ marginLeft: 10 }}
+              onClick={async () => {
+                if (!chatClient) return;
+                try {
+                  await chatClient.connect();
+                  fetchMessages(true);
+                } catch {}
+              }}
+            >
+              Retry
+            </button>
+          </div>
         ) : messages.length === 0 ? (
           <div className="no-messages-placeholder">No messages in this chat yet. Start the conversation below.</div>
         ) : (() => {
@@ -3937,7 +4334,21 @@ function ChatThread({
                   <span className="msg-time">
                     {new Date(m.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </span>
-                  {m.direction === 'out' && (
+                  {m._pending && !m._failed && <span className="msg-pending" title="Sending…">Sending…</span>}
+                  {m._failed && (
+                    <button
+                      type="button"
+                      className="msg-retry"
+                      onClick={() => {
+                        setMessages((prev) => prev.filter((x) => String(x._id) !== String(m._id)));
+                        setDraft(m.text || '');
+                        setTimeout(() => handleSend(), 0);
+                      }}
+                    >
+                      Failed — tap to retry
+                    </button>
+                  )}
+                  {m.direction === 'out' && !m._pending && !m._failed && (
                     <CheckCheckIcon size={14} className="msg-check" />
                   )}
                 </div>

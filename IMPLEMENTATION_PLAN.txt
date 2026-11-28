@@ -1,0 +1,354 @@
+REALTYDESK CRM
+PERFORMANCE, SPEED, CONNECTIVITY & USABILITY IMPLEMENTATION PLAN
+================================================================
+
+Date: 2026-11-28
+Status: AWAITING APPROVAL - no application code has been changed.
+Prepared after an audit of:
+  - client/src/App.tsx
+  - client/src/screens/Inbox.tsx
+  - client/src/lib/telegram.ts
+  - client/src/lib/telegramLiveService.ts
+  - client/src/lib/localDb.ts
+  - client/src/api/client.ts
+  - server/src/routes/chats.js
+  - server/src/app.js
+  - server/src/models/*.js
+
+
+1. GOALS
+--------
+1. Make the app feel alive: every wait must show a truthful, visible state.
+2. Reduce cold-start time and time-to-first-chat.
+3. Remove main-thread jank caused by cache writes and re-renders.
+4. Make connection loss and partial account failure obvious and recoverable.
+5. Give immediate feedback for every user action.
+6. Reduce unnecessary network payload and polling.
+
+
+2. SUCCESS METRICS (TARGETS)
+----------------------------
+- Cached chat list visible: under 400 ms after Inbox mounts.
+- First live dialogs merged: under 2.5 s on a normal network.
+- Chat switch with cached messages: under 100 ms.
+- Live message update: no main-thread task over 50 ms.
+- Connection state visible: within 1 s of any state change.
+- Recovery after network returns: under 5 s.
+- Every async action shows feedback within 100 ms.
+- No silent failures: persistent problems shown as a banner, not a 4 s toast.
+- Fewer API bytes per launch and fewer duplicate requests.
+
+
+3. CURRENT FINDINGS (ROOT CAUSES)
+---------------------------------
+#   Issue                                                              Location
+--  -----------------------------------------------------------------  ----------------------------------------
+1   Boot waits for keychain -> token refresh (up to 6 s) -> account   App.tsx:119-205
+    fetch (10 s) before the UI appears.
+2   Inbox awaits the server chat list before connecting Telegram,      Inbox.tsx:1456 vs 1489
+    so live chats cannot paint early.
+3   Dialog fetch blocks on GetBlocked (4 s) and waits for archived     telegramLiveService.ts:139-157
+    dialogs (20 s) inside the same Promise.all.
+4   seedKnownClients parses up to 5,000 localStorage ids on every      Inbox.tsx:992
+    chat update (every live message).
+5   Chat cache re-serializes up to 500 chats every 2.5 s; thread        Inbox.tsx:1917, 2856
+    cache rewrites 400 messages every 1.2 s.
+6   Status says "Live" if ANY account is live; partial failures are    Inbox.tsx:1476-1484, 1717
+    hidden; failures are only 4 s toasts.
+7   Watchdog ticks every 15 s, backoff up to 60 s; keep-alive checks    telegramLiveService.ts:889
+    accounts sequentially.                                             telegram.ts:484
+8   API GETs have no retry; 10 s timeout; many silent catches.         api/client.ts:16-57
+9   Archive/block/transfer/notes/unlink await the API with no          Inbox.tsx:1202, 3435
+    spinner; send has no optimistic bubble.
+10  /chats returns up to 1,000 populated rows; repeated-ids polls       server/routes/chats.js:192
+    every 30 s and on actions; full dialog batch-sync every launch.    Inbox.tsx:1409
+
+
+4. PHASE 0 - INSTRUMENTATION (0.5 day, low risk)
+-------------------------------------------------
+Purpose: measure before and after; avoid guessing.
+
+Tasks:
+[ ] Add performance.mark/measure around:
+    - App boot start and Inbox mount
+    - cached chat load
+    - server chat fetch
+    - each Telegram account connect
+    - dialog fetch
+    - first chat list paint
+    - thread fetch
+[ ] Log only when a debug flag is enabled (e.g. localStorage rd_perf_debug=1).
+[ ] Add a tiny hidden diagnostics view (optional) showing last timings and
+    per-account connection state.
+
+Acceptance:
+- We can state real timings for cold start, first paint, first dialogs,
+  chat switch, and reconnect.
+
+
+5. PHASE 1 - PERCEIVED SPEED & "NEVER LOOKS DEAD" (2-3 days, low risk)
+----------------------------------------------------------------------
+Goal: every wait has a visible, truthful state; no silent action.
+
+1.1 Boot fast-path
+    [ ] If a cached token exists, render the app shell/Inbox immediately.
+    [ ] Refresh the token in the background; keep the existing auth-failure
+        handler for a real logout.
+    [ ] Show elapsed time: "Still connecting... 4s".
+    [ ] Show "Reset session" after 8 s instead of silently cutting off.
+    [ ] Files: App.tsx.
+
+1.2 Parallel Inbox startup
+    [ ] Start cached chats, account fetch, server chat fetch, and Telegram
+        connects concurrently.
+    [ ] Paint cached chats first, merge server chats second, merge each
+        account's dialogs as it connects.
+    [ ] Remove the await ordering that delays Telegram behind the DB fetch.
+    [ ] Files: Inbox.tsx (mount effect around lines 1428-1808).
+
+1.3 Connection/status model
+    States to implement:
+      starting          -> "Starting RealtyDesk..."
+      loading-cache     -> "Loading saved conversations..."
+      connecting        -> "Connecting account 1 of 2..."
+      live              -> "Live"
+      partial           -> "1 of 2 accounts connected - retrying account X in 12s [Retry]"
+      reconnecting      -> "Reconnecting - attempt 2, next in 8s [Retry now]"
+      offline           -> "You're offline - showing saved chats. Sending resumes automatically. [Retry]"
+      server-unreachable-> "Can't reach RealtyDesk server. Telegram may still be live. [Retry]"
+      syncing-contacts  -> "Saving contacts in background - you can keep chatting"
+      up-to-date        -> brief "Up to date" confirmation
+    [ ] Add persistent banner under the header whenever not fully live.
+    [ ] Add per-account status rows in the drawer with individual Retry.
+    [ ] Do not show "Live" when any linked account is down.
+    [ ] Files: Inbox.tsx, styles.css.
+
+1.4 Feedback for every action
+    [ ] Add a pendingAction map keyed by chat/action.
+    [ ] Archive / unarchive: optimistic update + spinner + rollback on error.
+    [ ] Block / unblock: same.
+    [ ] Transfer: same.
+    [ ] Notes save: spinner + disabled state + error.
+    [ ] Template create/delete: spinner + disabled state + error.
+    [ ] Unlink account: progress state + error.
+    [ ] Refresh: spinner on the refresh control.
+    [ ] Files: Inbox.tsx.
+
+1.5 Thread and composer states
+    [ ] Show cached messages instantly.
+    [ ] While refreshing from Telegram, show a thin "Refreshing..." bar,
+        not a blank thread.
+    [ ] If no cache and the client is still connecting:
+        show "Connecting to Telegram..." with Retry, not "No messages".
+    [ ] Optimistic outgoing bubble with a clock icon.
+    [ ] On send failure: mark the bubble "Failed - tap to retry".
+    [ ] Files: Inbox.tsx (ChatThread).
+
+1.6 Last synced and background sync copy
+    [ ] Show "Updated just now / 2 min ago" in header or drawer.
+    [ ] Replace "Re-syncing with Telegram..." with
+        "Saving contacts in background - you can keep chatting".
+    [ ] Show a brief "Up to date" after completion.
+    [ ] Files: Inbox.tsx.
+
+Phase 1 acceptance:
+- Every wait and every action has visible feedback within 100 ms.
+- Cached chats appear almost immediately on launch.
+- Partial account failures are visible and retryable.
+- No "No messages" flash while a thread is still connecting.
+
+
+6. PHASE 2 - MAIN-THREAD & CACHE PERFORMANCE (3-4 days)
+-------------------------------------------------------
+Goal: remove jank and reduce work per live message.
+
+2.1 Known clients
+    [ ] Replace per-update localStorage parsing with a module-level
+        in-memory Set.
+    [ ] Hydrate once on first use.
+    [ ] Debounce localStorage writes (about 2 s).
+    [ ] Files: Inbox.tsx (seedKnownClients / getClientStatKey area).
+
+2.2 Chat cache
+    [ ] Cap the localStorage snapshot to 200 chats.
+    [ ] Debounce writes 5-8 s.
+    [ ] Write through requestIdleCallback when available.
+    [ ] Skip writes while the user is typing or scrolling.
+    [ ] Keep SQLite as the durable store.
+    [ ] Files: Inbox.tsx (cache effect), localDb.ts.
+
+2.3 Thread cache
+    [ ] Switch to incremental upserts (replaceAll=false).
+    [ ] Debounce 3 s.
+    [ ] Only write new/changed messages.
+    [ ] Files: Inbox.tsx (ChatThread write-through), localDb.ts.
+
+2.4 Translation
+    [ ] Queue with concurrency 2-3.
+    [ ] Translate only the newest ~12 messages on open.
+    [ ] Pause when the window is hidden.
+    [ ] Abort in-flight work when switching chats.
+    [ ] Files: Inbox.tsx, translation.ts.
+
+2.5 Live update coalescing
+    [ ] Batch rapid messages per chat into one state update
+        (100-150 ms window).
+    [ ] Keep the optimistic single-message path instant.
+    [ ] Files: Inbox.tsx.
+
+2.6 Derived data
+    [ ] Memoize remaining per-render filters/counts.
+    [ ] Keep ChatItem props stable (it is already memoized).
+    [ ] Files: Inbox.tsx.
+
+Phase 2 acceptance:
+- No main-thread task over 50 ms during normal live traffic.
+- Faster chat switching and scrolling on low-end machines.
+- Cache writes no longer visible as input/scroll jank.
+
+
+7. PHASE 3 - CONNECTIVITY & RECOVERY (2-3 days)
+-----------------------------------------------
+Goal: fast, honest recovery and no false "Live".
+
+3.1 Dialog fetch restructure
+    [ ] Move GetBlocked to the background.
+    [ ] Return main dialogs first (initial limit 60).
+    [ ] Fetch archived dialogs separately (initial limit 20) and merge
+        when ready.
+    [ ] Files: telegramLiveService.ts (fetchLiveTelegramChats).
+
+3.2 Adaptive watchdog and backoff
+    [ ] 5 s tick while connecting; 15-20 s while live.
+    [ ] Backoff 1 s -> 20 s max, with jitter.
+    [ ] Reset on online/visible.
+    [ ] Files: telegramLiveService.ts (subscribeLiveTelegramUpdates).
+
+3.3 Keep-alive
+    [ ] Check accounts in parallel with Promise.allSettled.
+    [ ] Timeout 8 s per account.
+    [ ] Skip if a dialog fetch just ran.
+    [ ] Files: telegram.ts.
+
+3.4 API retry layer
+    [ ] Retry idempotent GETs twice with jitter on timeout/5xx/network.
+    [ ] Distinguish offline vs server-down vs Telegram-down.
+    [ ] Surface one persistent banner instead of silent catches.
+    [ ] Files: api/client.ts, Inbox.tsx.
+
+3.5 Coalesce refreshes
+    [ ] loadChats queues a trailing refresh instead of dropping calls
+        while one is in flight.
+    [ ] One refresh after multi-account reconnect, not one per account.
+    [ ] Files: Inbox.tsx.
+
+3.6 CRM mirror queue
+    [ ] Debounce mirrorLiveChatToCRM per chat (about 400 ms).
+    [ ] Batch messages.
+    [ ] Retry once on failure.
+    [ ] Queue failures and flush on reconnect.
+    [ ] Files: telegramLiveService.ts, Inbox.tsx.
+
+Phase 3 acceptance:
+- Recovery after network return under about 5 s.
+- Partial account failures shown accurately.
+- No lost outgoing or CRM sync updates during short outages.
+
+
+8. PHASE 4 - DATA & API EFFICIENCY (3-5 days, optional but recommended)
+----------------------------------------------------------------------
+Goal: scale beyond a few hundred chats and reduce bandwidth/CPU.
+
+4.1 Chat listing
+    [ ] Add cursor pagination and updatedSince to /chats.
+    [ ] Default limit 200 instead of 1,000 populated rows.
+    [ ] Client loads the first page, then pages on scroll/search.
+    [ ] Files: server/src/routes/chats.js, api/client.ts, Inbox.tsx.
+
+4.2 Repeated IDs
+    [ ] Add server-side cache or ETag.
+    [ ] Client sends a conditional request.
+    [ ] Pause polling when the window is hidden.
+    [ ] Poll 30 s -> 60 s when idle.
+    [ ] Files: server/src/routes/chats.js, api/client.ts, Inbox.tsx.
+
+4.3 Batch sync
+    [ ] Delta sync with updatedSince or a content hash.
+    [ ] Do not re-send unchanged contacts every launch.
+    [ ] Files: server/src/routes/sync.js, Inbox.tsx.
+
+4.4 Server delivery
+    [ ] Add compression middleware.
+    [ ] Add compound indexes:
+        { orgId: 1, lastMessageAt: -1 }
+        { orgId: 1, telegramAccountId: 1, isArchived: 1 }
+    [ ] Review express.json limit (currently 16 MB).
+    [ ] Files: server/src/app.js, server/src/models/Chat.js.
+
+Phase 4 acceptance:
+- Lower bytes and CPU per launch.
+- Owner/org-wide view stays responsive with large data sets.
+- No behavior change visible to users beyond speed.
+
+
+9. OUT OF SCOPE
+---------------
+- Rewriting the Telegram integration or switching libraries.
+- Changing authentication or server-side session storage.
+- Redesigning the visual style or layout.
+- Adding new product features.
+- Changing the daily counters (already fixed separately).
+
+
+10. RISKS & GUARDRAILS
+----------------------
+- Boot fast-path: a brief logged-out flicker is possible if refresh fails.
+  Mitigation: cached role + existing auth-failure handler + feature flag.
+- Optimistic actions: need rollback tests for archive/block/transfer.
+- Pagination: changes /chats behavior. Keep a feature flag and fall back
+  to the current endpoint.
+- Status model: do not mark "Live" until all linked accounts are connected.
+- Every phase must pass: TypeScript check, production build, and a manual
+  test matrix (cold start, offline start, reconnect, send, archive, search).
+
+
+11. ROLLOUT OPTIONS
+-------------------
+Option A: Phase 1 only
+  Time: 2-3 days
+  Best for: fastest visible improvement, lowest risk.
+
+Option B: Phase 1 + 2
+  Time: about 1 week
+  Best for: smooth UI with no jank.
+
+Option C: Phase 1 + 2 + 3  (RECOMMENDED)
+  Time: about 1.5 weeks
+  Best for: full performance, connectivity, and UX pass.
+
+Option D: All four phases
+  Time: about 2-2.5 weeks
+  Best for: long-term scale and lower bandwidth.
+
+Recommended order if starting small:
+  Phase 1 -> Phase 3 -> Phase 2 -> Phase 4
+  (Phase 1 fixes the "dead app" feeling; Phase 3 fixes real-world stalls.)
+
+
+12. APPROVAL
+------------
+No code will be changed until this plan is approved.
+
+Approve one option (write X):
+
+  [ ] Option A - Phase 1 only
+  [ ] Option B - Phase 1 + 2
+  [ ] Option C - Phase 1 + 2 + 3 (recommended)
+  [ ] Option D - All phases
+
+Additional instructions / exclusions:
+______________________________________________________________
+______________________________________________________________
+______________________________________________________________
+
+Approved by: ______________________________   Date: ____________

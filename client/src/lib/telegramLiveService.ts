@@ -133,28 +133,40 @@ export async function fetchLiveTelegramChats(
   }
 
   try {
-    // 1. Get blocked contacts from Telegram so they are accurately tagged
+    // 1. Get blocked contacts from Telegram in the BACKGROUND (do not block
+    // dialog loading). Results are merged in when available.
     const blockedUserIds = new Set<string>();
-    try {
-      const blockedRes: any = await withTimeout(
-        client.invoke(new (Api as any).contacts.GetBlocked({ offset: 0, limit: 100 })),
-        4000
-      );
-      if (blockedRes?.blocked && Array.isArray(blockedRes.blocked)) {
-        for (const b of blockedRes.blocked) {
-          const pid = b.peerId?.userId || b.peerId?.chatId || b.peerId?.channelId || b.userId;
-          if (pid) blockedUserIds.add(String(pid));
+    (async () => {
+      try {
+        const blockedRes: any = await withTimeout(
+          client.invoke(new (Api as any).contacts.GetBlocked({ offset: 0, limit: 100 })),
+          4000
+        );
+        if (blockedRes?.blocked && Array.isArray(blockedRes.blocked)) {
+          for (const b of blockedRes.blocked) {
+            const pid = b.peerId?.userId || b.peerId?.chatId || b.peerId?.channelId || b.userId;
+            if (pid) blockedUserIds.add(String(pid));
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    })();
 
-    // 2. Fetch dialogs directly from Telegram MTProto (both main folder and archived folder 1)
-    // Limit startup sync to recent active chats; rely on NewMessage events for the rest.
-    const archivedLimit = Math.min(limit, 30);
-    const [mainDialogs, archivedDialogs] = await Promise.all([
-      withTimeout(client.getDialogs({ limit }), 30000).then((r) => r || []).catch(() => []),
-      withTimeout(client.getDialogs({ folder: 1, limit: archivedLimit }), 20000).then((r) => r || []).catch(() => []),
-    ]);
+    // 2. Fetch main dialogs first (fast), then archived (best-effort, short
+    // timeout) without letting the archived batch gate the main result.
+    const mainLimit = Math.min(limit, 60);
+    const archivedLimit = Math.min(limit, 20);
+    const mainDialogs = await withTimeout(client.getDialogs({ limit: mainLimit }), 20000)
+      .then((r) => r || [])
+      .catch(() => []);
+    let archivedDialogs: any[] = [];
+    try {
+      archivedDialogs = await withTimeout(
+        client.getDialogs({ folder: 1, limit: archivedLimit }),
+        5000
+      )
+        .then((r) => r || [])
+        .catch(() => []);
+    } catch {}
 
     // Explicitly tag any dialog that comes from the archived folder
     if (Array.isArray(archivedDialogs)) {
@@ -853,8 +865,8 @@ export function subscribeLiveTelegramUpdates(
         ? await getActiveTelegramClient(options.accountId)
         : null;
       if (!next || !next.connected) {
-        failureCount = Math.min(failureCount + 1, 8);
-        nextRetryAt = Date.now() + Math.min(60_000, 1500 * Math.pow(2, Math.min(failureCount - 1, 5)));
+        failureCount = Math.min(failureCount + 1, 6);
+        nextRetryAt = Date.now() + Math.min(20_000, 1000 * Math.pow(2, Math.min(failureCount - 1, 4))) + Math.round(Math.random() * 500);
         options.onStatus?.(isOsOffline() ? 'waiting' : 'connecting');
         return;
       }
@@ -870,8 +882,8 @@ export function subscribeLiveTelegramUpdates(
       options.onReconnect?.();
     } catch (err) {
       console.warn('[telegramLiveService] Live reconnect failed:', err);
-      failureCount = Math.min(failureCount + 1, 8);
-      nextRetryAt = Date.now() + Math.min(60_000, 1500 * Math.pow(2, Math.min(failureCount - 1, 5)));
+      failureCount = Math.min(failureCount + 1, 6);
+      nextRetryAt = Date.now() + Math.min(20_000, 1000 * Math.pow(2, Math.min(failureCount - 1, 4))) + Math.round(Math.random() * 500);
       options.onStatus?.(isOsOffline() ? 'waiting' : 'connecting');
     } finally {
       reconnecting = false;
@@ -886,7 +898,15 @@ export function subscribeLiveTelegramUpdates(
     void ensureLive();
   }
 
-  const timer = setInterval(() => { void ensureLive(); }, options.watchdogMs ?? 15_000);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleWatchdog = () => {
+    if (stopped) return;
+    const ms = activeClient?.connected ? (options.watchdogMs ?? 15_000) : 5_000;
+    timer = setTimeout(() => {
+      void ensureLive().finally(scheduleWatchdog);
+    }, ms);
+  };
+  scheduleWatchdog();
   const onOnline = () => {
     nextRetryAt = 0;
     failureCount = 0;
@@ -912,7 +932,7 @@ export function subscribeLiveTelegramUpdates(
 
   return () => {
     stopped = true;
-    clearInterval(timer);
+    if (timer) clearTimeout(timer);
     try {
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
@@ -990,41 +1010,115 @@ export async function buildLiveChatFromPeer(
 /**
  * Background silent sync to MongoDB so CRM notes, tags, and contacts are preserved.
  * Runs completely non-blocking without delaying the user interface.
+ *
+ * Messages are debounced per chat (~400ms) and batched into a single sync
+ * request. Failed flushes are retried once and, on continued failure, queued
+ * for a later flush (see flushMirrorQueue).
  */
+interface MirrorQueueEntry {
+  telegramAccountId: string;
+  chat: LiveChat;
+  messages: LiveMessage[];
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const mirrorQueue = new Map<string, MirrorQueueEntry>();
+
+async function flushMirrorQueueEntry(key: string): Promise<void> {
+  const entry = mirrorQueue.get(key);
+  if (!entry || entry.messages.length === 0) {
+    if (entry) entry.timer = undefined;
+    return;
+  }
+  const toSend = entry.messages.slice(-15);
+  const rest = entry.messages.slice(0, Math.max(0, entry.messages.length - toSend.length));
+  entry.messages = rest;
+  entry.timer = undefined;
+
+  const payload = {
+    telegramAccountId: entry.telegramAccountId,
+    chatExternalId: entry.chat.externalChatId,
+    contact: {
+      telegramUserId: entry.chat.contactId?.telegramUserId,
+      username: entry.chat.contactId?.username,
+      phoneNumber: entry.chat.contactId?.phoneNumber,
+      displayName: entry.chat.contactId?.displayName,
+      savedName: entry.chat.contactId?.savedName,
+      firstName: entry.chat.contactId?.firstName,
+      lastName: entry.chat.contactId?.lastName,
+      avatarUrl: entry.chat.contactId?.avatarUrl,
+      isBlocked: entry.chat.isBlocked,
+    },
+    isArchived: entry.chat.isArchived,
+    messages: toSend.map((m) => ({
+      telegramMessageId: m.telegramMessageId,
+      direction: m.direction,
+      senderType: m.senderType,
+      senderId: m.senderId,
+      text: m.text,
+      mediaRef: m.mediaRef,
+      sentAt: m.sentAt,
+    })),
+  };
+
+  const send = () => api.syncMessages(payload as any);
+  try {
+    await send();
+  } catch {
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      await send();
+    } catch {
+      const cur = mirrorQueue.get(key);
+      if (cur) {
+        cur.messages = [...toSend, ...cur.messages];
+      } else {
+        mirrorQueue.set(key, {
+          telegramAccountId: entry.telegramAccountId,
+          chat: entry.chat,
+          messages: toSend,
+        });
+      }
+      return;
+    }
+  }
+
+  const cur = mirrorQueue.get(key);
+  if (cur && cur.messages.length > 0 && !cur.timer) {
+    cur.timer = setTimeout(() => {
+      void flushMirrorQueueEntry(key);
+    }, 400);
+  }
+}
+
+export function flushMirrorQueue(): void {
+  for (const key of mirrorQueue.keys()) {
+    const entry = mirrorQueue.get(key);
+    if (entry && entry.messages.length > 0 && !entry.timer) {
+      entry.timer = setTimeout(() => {
+        void flushMirrorQueueEntry(key);
+      }, 200);
+    }
+  }
+}
+
 export async function mirrorLiveChatToCRM(
   telegramAccountId: string,
   chat: LiveChat,
   messages: LiveMessage[] = []
 ): Promise<void> {
-  try {
-    // CRM save only - instant and no Telegram API cost.
-    // Telegram address-book saving is handled separately by the live-message queue.
-    await api.syncMessages({
-      telegramAccountId,
-      chatExternalId: chat.externalChatId,
-      contact: {
-        telegramUserId: chat.contactId?.telegramUserId,
-        username: chat.contactId?.username,
-        phoneNumber: chat.contactId?.phoneNumber,
-        displayName: chat.contactId?.displayName,
-        savedName: chat.contactId?.savedName,
-        firstName: chat.contactId?.firstName,
-        lastName: chat.contactId?.lastName,
-        avatarUrl: chat.contactId?.avatarUrl,
-        isBlocked: chat.isBlocked,
-      },
-      isArchived: chat.isArchived,
-      messages: messages.slice(-15).map((m) => ({
-        telegramMessageId: m.telegramMessageId,
-        direction: m.direction,
-        senderType: m.senderType,
-        senderId: m.senderId,
-        text: m.text,
-        mediaRef: m.mediaRef,
-        sentAt: m.sentAt,
-      })),
-    });
-  } catch (err) {
-    // Non-fatal, silent background sync
-  }
+  const key = `${telegramAccountId}:${chat.externalChatId}`;
+  const entry = mirrorQueue.get(key) || {
+    telegramAccountId,
+    chat,
+    messages: [],
+  };
+  entry.chat = chat;
+  entry.messages = [...entry.messages, ...messages];
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => {
+    void flushMirrorQueueEntry(key);
+  }, 400);
+  mirrorQueue.set(key, entry);
+  return;
 }

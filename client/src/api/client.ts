@@ -13,7 +13,9 @@ export function registerAuthFailureHandler(handler: () => void) {
   authFailureHandler = handler;
 }
 
-async function request<T>(path: string, options: RequestInit = {}, isRetry = false): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, isRetry = false, attempt = 0): Promise<T> {
+  const method = (options.method || 'GET').toUpperCase();
+  const isGet = method === 'GET';
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort(new Error('Request timed out after 10 seconds'));
@@ -35,19 +37,35 @@ async function request<T>(path: string, options: RequestInit = {}, isRetry = fal
       // Access token expired — try a refresh once, then retry the request.
       const refreshed = await tryRefresh();
       if (refreshed) {
-        return request<T>(path, options, true);
+        return request<T>(path, options, true, attempt);
       }
       if (authFailureHandler) authFailureHandler();
     }
 
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || `Request failed: ${res.status}`);
+      const err: any = new Error(body.error || `Request failed: ${res.status}`);
+      err.status = res.status;
+      throw err;
     }
 
     return res.json();
   } catch (err: any) {
-    if (err.name === 'AbortError' || err.message?.includes('aborted')) {
+    const status = err?.status;
+    const isAbort = err?.name === 'AbortError' || err?.message?.includes('aborted');
+    const retryable =
+      isGet &&
+      !isRetry &&
+      attempt < 2 &&
+      (isAbort || !status || status >= 500);
+
+    if (retryable) {
+      const delay = 300 * Math.pow(2, attempt) + Math.round(Math.random() * 200);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return request<T>(path, options, isRetry, attempt + 1);
+    }
+
+    if (isAbort) {
       throw new Error('Server request timed out. Please verify the backend server and MongoDB database are reachable.');
     }
     throw err;
